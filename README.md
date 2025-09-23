@@ -1,2 +1,2 @@
 # GenSQL
-Stop generating SQL. Start asking questions.
+Stop writing SQL. Start generating it.
