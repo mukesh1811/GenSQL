@@ -75,8 +75,7 @@ def _init_state():
     ss.setdefault("selected_tables", [])          # List of dicts: [{"project":..., "dataset":..., "table":...}]
     ss.setdefault("schema_df", pd.DataFrame())    # Last loaded/edited schema
     ss.setdefault("pick", {"project": None, "dataset": None, "table": None})  # UI selections
-    # ss.setdefault("smpl_tbl_desc" , "")
-    # st.session_state.smpl_tbl_desc = ""
+    ss.setdefault("smpl_tbl_desc", "")          # For the sample table description text area
 
 _init_state()
 
@@ -93,11 +92,18 @@ def set_ctx_if_ready():
         not st.session_state.schema_df.empty
     )
 
-def add_selected_table(project, dataset, table):
+def add_selected_table(project, dataset, table, description=""):
     if not (project and dataset and table):
         return
-    entry = {"project": project, "dataset": dataset, "table": table}
-    if entry not in st.session_state.selected_tables:
+
+    # Check if a table with the same project, dataset, and table name already exists.
+    is_present = any(
+        t["project"] == project and t["dataset"] == dataset and t["table"] == table
+        for t in st.session_state.selected_tables
+    )
+
+    if not is_present:
+        entry = {"project": project, "dataset": dataset, "table": table, "description": description}
         st.session_state.selected_tables.append(entry)
         set_ctx_if_ready()
 
@@ -239,7 +245,8 @@ def render_ctx_page():
                     add_selected_table(
                         st.session_state.pick["project"],
                         st.session_state.pick["dataset"],
-                        st.session_state.pick["table"]
+                        st.session_state.pick["table"],
+                        description=st.session_state.smpl_tbl_desc
                     )
                     set_ctx_if_ready()
                     st.rerun()
@@ -350,6 +357,8 @@ def render_ctx_page():
                     col_a, col_b = st.columns([6, 1])
                     with col_a:
                         st.write(f"• `{row['project']}.{row['dataset']}.{row['table']}`")
+                        if row.get("description"):
+                            st.caption(row['description'])
                     with col_b:
                         st.button("Remove", key=f"rm_{i}", on_click=remove_selected_table, args=(i,))
 
@@ -393,11 +402,14 @@ else:
         st.sidebar.caption("Tables:")
         for row in st.session_state.selected_tables:
             st.sidebar.write(f"- `{row['project']}.{row['dataset']}.{row['table']}`")
+            if row.get("description"):
+                st.sidebar.caption(row['description'])
     if not st.session_state.schema_df.empty:
         st.sidebar.caption("Schema: loaded")
 
 if st.sidebar.button("Set Context", icon="🧠", width='stretch'):
     st.session_state.view = "context"
+    st.rerun()
 
 with st.sidebar.expander("ℹ️ How it works", expanded=False):
     st.markdown(
