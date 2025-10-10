@@ -181,8 +181,8 @@ def render_ctx_page():
             st.write(f"`{prj}.{dtset}.{tbl}`")
             
             col_tbldesc , col_enhbtn = st.columns([9,2],
-                                            vertical_alignment="center"
-                                        )
+                                               vertical_alignment="center"
+                                              )
             
             with col_tbldesc:
                 st.text_area("Table Description",
@@ -417,3 +417,5 @@ if st.session_state.view == "context":
     render_ctx_page()
 else:
     render_default_page()
+
+
