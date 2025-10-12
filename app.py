@@ -2,14 +2,37 @@
 
 import pandas as pd
 import streamlit as st
+import json
 
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPIError, Forbidden
+import google.auth
+
+# Gemini / Vertex AI Imports
+import vertexai
+from vertexai.generative_models import GenerativeModel
+
 
 @st.cache_resource(show_spinner=True)
 def get_bq_client():
     # Uses ADC from `gcloud auth application-default login`
     return bigquery.Client()
+
+
+@st.cache_resource(show_spinner="Initializing AI...")
+def get_model():
+    """Initializes Vertex AI and returns a Gemini model instance."""
+    try:
+        # Get project ID from Application Default Credentials
+        _, project_id = google.auth.default()
+        vertexai.init(project=project_id)
+    except (google.auth.exceptions.DefaultCredentialsError, AttributeError):
+        st.warning("Could not determine GCP project from credentials. Some AI features may not work.")
+        # Fallback initialization
+        vertexai.init()
+    # Use the stable model identifier for the latest version
+    return GenerativeModel("gemini-2.5-flash")
+
 
 @st.cache_data(show_spinner=False)
 def list_projects():
@@ -17,30 +40,48 @@ def list_projects():
     # Uses Resource Manager via BigQuery client under the hood
     return [p.project_id for p in client.list_projects()]
 
+
 @st.cache_data(show_spinner=False)
 def list_datasets(project_id: str):
     client = get_bq_client()
     return [d.dataset_id for d in client.list_datasets(project=project_id)]
+
 
 @st.cache_data(show_spinner=False)
 def list_tables(project_id: str, dataset_id: str):
     client = get_bq_client()
     return [t.table_id for t in client.list_tables(f"{project_id}.{dataset_id}")]
 
-# =========================
-# Constants / Dummy Catalog
-# =========================
-DUMMY_CATALOG = {
-    "gen-prod": {
-        "sales": ["orders", "customers", "order_items"],
-        "supply_chain": ["shipments", "inventory", "suppliers"],
-    },
-    "gen-dev": {
-        "playground": ["events", "users", "sessions"],
-        "marketing": ["campaigns", "leads", "touchpoints"],
-    },
-}
 
+@st.cache_data(show_spinner="Fetching table schema...")
+def get_table_schema(project_id: str, dataset_id: str, table_id: str) -> pd.DataFrame:
+    """Fetches the schema for a given BigQuery table."""
+    client = get_bq_client()
+    query = f"""
+        SELECT
+            table_catalog,
+            table_schema,
+            table_name,
+            column_name,
+            data_type
+        FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = '{table_id}'
+    """
+    try:
+        df = client.query(query).to_dataframe()
+        # Add the editable description column, matching the other tab
+        default_desc = "<IMP: Add a brief description>"
+        df["column_description"] = default_desc
+        df["column_description"] = df["column_description"].astype("string")
+        return df
+    except Exception as e:
+        st.error(f"Failed to fetch schema: {e}")
+        return pd.DataFrame()
+
+
+# =========================
+# Constants
+# =========================
 SCHEMA_EXTRACTION_QRY = """
 -- Copy & run in BigQuery to list the table schema
 SELECT
@@ -69,13 +110,19 @@ st.set_page_config(
 # =========================
 def _init_state():
     ss = st.session_state
-    ss.setdefault("view", "analysis")             # "analysis" | "context"
-    ss.setdefault("auth", False)                  # Simulated auth
-    ss.setdefault("ctx_set", False)               # Becomes True when a table is selected or schema uploaded
-    ss.setdefault("selected_tables", [])          # List of dicts: [{"project":..., "dataset":..., "table":...}]
-    ss.setdefault("schema_df", pd.DataFrame())    # Last loaded/edited schema
-    ss.setdefault("pick", {"project": None, "dataset": None, "table": None})  # UI selections
-    ss.setdefault("smpl_tbl_desc", "")          # For the sample table description text area
+    ss.setdefault("view", "analysis")
+    ss.setdefault("auth", False)
+    ss.setdefault("ctx_set", False)
+    ss.setdefault("selected_tables", [])
+    ss.setdefault("schema_df", pd.DataFrame())
+    ss.setdefault("pick", {"project": None, "dataset": None, "table": None})
+    # State for "Upload Schema" tab
+    ss.setdefault("smpl_tbl_desc", "")
+    ss.setdefault("upload_schema_df", pd.DataFrame()) # Holds the temporary schema for preview
+    # State for "Pick BQ Table" tab
+    ss.setdefault("bq_table_desc", "")
+    ss.setdefault("bq_schema_df", pd.DataFrame())
+
 
 _init_state()
 
@@ -83,40 +130,131 @@ _init_state()
 # =========================
 # Helpers
 # =========================
-def enh_smpl_tbl_desc():
-    st.session_state.smpl_tbl_desc = "The citibike_trips table contains log of all individual trips taken on the New York City (NYC) Citi Bike shared bicycle system"
-
 def set_ctx_if_ready():
-    """Mark context set if we have at least one selected table OR a non-empty schema."""
-    st.session_state.ctx_set = bool(st.session_state.selected_tables) or (
+    """Mark context set if we have a selected table and a non-empty schema."""
+    st.session_state.ctx_set = bool(st.session_state.selected_tables) and (
         not st.session_state.schema_df.empty
     )
 
-def add_selected_table(project, dataset, table, description=""):
-    if not (project and dataset and table):
+
+def set_context(project: str, dataset: str, table: str, description: str, schema_df: pd.DataFrame):
+    """Overwrites the current context with the provided table information."""
+    if not all([project, dataset, table]) or schema_df.empty:
+        st.error("Cannot set context with incomplete information.")
         return
 
-    # Check if a table with the same project, dataset, and table name already exists.
-    is_present = any(
-        t["project"] == project and t["dataset"] == dataset and t["table"] == table
-        for t in st.session_state.selected_tables
+    st.session_state.selected_tables = [
+        {"project": project, "dataset": dataset, "table": table, "description": description}
+    ]
+    st.session_state.schema_df = schema_df
+    set_ctx_if_ready()
+    st.toast(f"Context set to `{project}.{dataset}.{table}`", icon="🧠")
+
+
+def clear_context():
+    """Clears all context from the session state."""
+    st.session_state.selected_tables = []
+    st.session_state.schema_df = pd.DataFrame()
+    st.session_state.ctx_set = False
+    st.toast("Context cleared.", icon="🗑️")
+    st.rerun()
+
+
+def add_bq_table_to_context():
+    """Overwrites the main context with the selected BQ table and its schema."""
+    set_context(
+        project=st.session_state.pick["project"],
+        dataset=st.session_state.pick["dataset"],
+        table=st.session_state.pick["table"],
+        description=st.session_state.bq_table_desc,
+        schema_df=st.session_state.bq_schema_df
     )
+    st.session_state.bq_schema_df = pd.DataFrame()
+    st.session_state.bq_table_desc = ""
+    st.rerun()
 
-    if not is_present:
-        entry = {"project": project, "dataset": dataset, "table": table, "description": description}
-        st.session_state.selected_tables.append(entry)
-        set_ctx_if_ready()
 
-def remove_selected_table(idx: int):
-    if 0 <= idx < len(st.session_state.selected_tables):
-        st.session_state.selected_tables.pop(idx)
-        set_ctx_if_ready()
+def on_project_change():
+    """Reset downstream selections and temporary schema state when project changes."""
+    st.session_state.pick.update({"dataset": None, "table": None})
+    st.session_state.bq_schema_df = pd.DataFrame()
+    st.session_state.bq_table_desc = ""
 
-def get_datasets(project):
-    return sorted(list(DUMMY_CATALOG.get(project, {}).keys()))
 
-def get_tables(project, dataset):
-    return sorted(DUMMY_CATALOG.get(project, {}).get(dataset, []))
+def on_dataset_change():
+    """Reset downstream selections and temporary schema state when dataset changes."""
+    st.session_state.pick.update({"table": None})
+    st.session_state.bq_schema_df = pd.DataFrame()
+    st.session_state.bq_table_desc = ""
+
+
+def enh_smpl_tbl_desc():
+    st.session_state.smpl_tbl_desc = "The citibike_trips table contains log of all individual trips taken on the New York City (NYC) Citi Bike shared bicycle system"
+
+
+# --- Gemini Helper Functions ---
+def enhance_table_description_llm():
+    model = get_model()
+    project, dataset, table = st.session_state.pick.values()
+    schema_df = st.session_state.bq_schema_df
+
+    if not all([project, dataset, table]) or schema_df.empty:
+        st.warning("Please select a valid table first.")
+        return
+
+    schema_str = "\n".join([f"- {row.column_name} ({row.data_type})" for _, row in schema_df.iterrows()])
+    prompt = f"""
+    Based on the fully qualified table name `{project}.{dataset}.{table}` and its schema, please provide a concise, one-sentence description of what this table likely contains.
+
+    Schema:
+    {schema_str}
+
+    Description:
+    """
+    with st.spinner("🪄 Enhancing table description..."):
+        try:
+            response = model.generate_content(prompt)
+            st.session_state.bq_table_desc = response.text.strip()
+        except Exception as e:
+            st.error(f"AI enhancement failed: {e}")
+
+
+def enhance_column_descriptions_llm():
+    model = get_model()
+    project, dataset, table = st.session_state.pick.values()
+    schema_df = st.session_state.bq_schema_df.copy()
+
+    if not all([project, dataset, table]) or schema_df.empty:
+        st.warning("Please select a valid table first.")
+        return
+
+    cols_to_describe = schema_df[['column_name', 'data_type']].to_dict('records')
+    prompt = f"""
+    Given the table name `{project}.{dataset}.{table}`, provide a concise, one-line description for each of the following columns.
+    Return the output as a simple JSON object where keys are the column names and values are the descriptions. Do not include any other text or markdown formatting.
+
+    Columns:
+    {cols_to_describe}
+
+    JSON Output:
+    """
+    with st.spinner("🪄 Enhancing column descriptions..."):
+        try:
+            response = model.generate_content(prompt)
+            json_str = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+
+            try:
+                desc_dict = json.loads(json_str)
+                descriptions = pd.Series(desc_dict)
+                schema_df['column_description'] = schema_df['column_name'].map(descriptions).fillna(schema_df['column_description'])
+                st.session_state.bq_schema_df = schema_df
+                st.rerun()
+            except json.JSONDecodeError:
+                st.error("AI model returned an invalid JSON format. Please try again.")
+                st.code(json_str, language="json")
+
+        except Exception as e:
+            st.error(f"AI enhancement failed: {e}")
 
 
 # =========================
@@ -128,7 +266,6 @@ def render_ctx_page():
 
     tab_upl, tab_pick = st.tabs(["Upload Schema", "Pick a BigQuery table"])
 
-    # ---------- Upload Schema ----------
     with tab_upl:
         st.subheader("1. Pick Schema")
         st.write("**Upload your schema file (CSV)**")
@@ -137,124 +274,96 @@ def render_ctx_page():
             st.code(SCHEMA_EXTRACTION_QRY, language="sql")
 
         uploaded = st.file_uploader(
-            "**Upload your schema file (CSV)**",
-            type=["csv"],
-            label_visibility="collapsed",
+            "**Upload your schema file (CSV)**", type=["csv"], label_visibility="collapsed"
         )
-
-        schema = st.session_state.schema_df.copy()
-
         if uploaded:
             try:
-                schema = pd.read_csv(uploaded)
+                st.session_state.upload_schema_df = pd.read_csv(uploaded, dtype=str)
+                st.session_state.smpl_tbl_desc = "" # Reset description on new upload
             except Exception as e:
                 st.error(f"Failed to read CSV: {e}")
+                st.session_state.upload_schema_df = pd.DataFrame()
 
         st.write("(**or**)")
         st.write("**Use sample schema**")
         if st.button("NY Citibike trips table schema", icon="🚲"):
-            # Expect a local sample for demo; replace with your path or inline sample
-            schema = pd.DataFrame(
-                {
-                    "column_name": ["ride_id", "started_at", "ended_at", "start_station_id", "end_station_id"],
-                    "data_type": ["STRING", "TIMESTAMP", "TIMESTAMP", "STRING", "STRING"],
-                }
-            )
-            schema = pd.read_csv("data/sample_schema.csv")
+            try:
+                # A real app might download this, here we load from local
+                st.session_state.upload_schema_df = pd.read_csv("data/sample_schema.csv", dtype=str)
+                st.session_state.smpl_tbl_desc = "" # Reset description
+            except FileNotFoundError:
+                st.error("`data/sample_schema.csv` not found. Please create this file for the sample to work.")
+                st.session_state.upload_schema_df = pd.DataFrame()
 
-        # Ensure description column exists & editable
-        col = "column_description"
-        default_desc = "<IMP: Add a brief description>"
-        if not schema.empty:
-            if col not in schema.columns:
-                schema[col] = default_desc
-            schema[col] = schema[col].astype("string").fillna(default_desc)
+
+        # This is the robust sanitization step for the uploaded schema
+        upload_schema_df = st.session_state.upload_schema_df
+        if not upload_schema_df.empty:
+            col, default_desc = "column_description", "<IMP: Add a brief description>"
+            
+            # If the description column doesn't exist, add it
+            if col not in upload_schema_df.columns:
+                upload_schema_df[col] = default_desc
+            
+            # Crucial Fix: Ensure the column is string type and fill NAs
+            # This handles cases where the column exists but has empty values read as NaN
+            upload_schema_df[col] = upload_schema_df[col].astype("string").fillna(default_desc)
+            
+            # Update the session state with the sanitized dataframe
+            st.session_state.upload_schema_df = upload_schema_df
+
 
         st.divider()
         st.subheader("2. Schema Preview")
 
-
-        if schema.empty:
-            st.info("No schema loaded yet.")
+        if st.session_state.upload_schema_df.empty:
+            st.info("Load a schema to begin.")
+            if st.session_state.selected_tables:
+                 st.caption("**Current Context:**")
+                 row = st.session_state.selected_tables[0]
+                 st.write(f"• `{row['project']}.{row['dataset']}.{row['table']}`")
         else:
-            st.caption("**Selected tables:**")
-
-            prj = schema['table_catalog'].unique()[0]
-            dtset = schema['table_schema'].unique()[0]
-            tbl = schema['table_name'].unique()[0]
-
-            
+            upload_schema_df_for_editor = st.session_state.upload_schema_df
+            st.caption("**Preview of new context:**")
+            prj, dtset, tbl = upload_schema_df_for_editor['table_catalog'].unique()[0], upload_schema_df_for_editor['table_schema'].unique()[0], upload_schema_df_for_editor['table_name'].unique()[0]
             st.write(f"`{prj}.{dtset}.{tbl}`")
-            
-            col_tbldesc , col_enhbtn = st.columns([9,2],
-                                               vertical_alignment="center"
-                                              )
-            
+
+            col_tbldesc, col_enhbtn = st.columns([9, 2], vertical_alignment="center")
             with col_tbldesc:
-                st.text_area("Table Description",
-                    # value=st.session_state.smpl_tbl_desc,
-                    key="smpl_tbl_desc",
-                    placeholder="Add custom description for this table",
-                    label_visibility="collapsed",
-                    height="content"
-                )
-            
+                st.text_area("Table Description", key="smpl_tbl_desc", placeholder="Add custom description for this table", label_visibility="collapsed")
             with col_enhbtn:
-                st.button("Enhance", 
-                          icon = "🪄" , 
-                          width="stretch" , 
-                          help="A.I. will populate the table description for you",
-                          on_click=enh_smpl_tbl_desc
-                        
-                        )
-            
+                st.button("Enhance", icon="🪄", width="stretch", help="A.I. will populate the table description for you", on_click=enh_smpl_tbl_desc)
+
             st.divider()
             st.caption("**Table Schema**")
-            # Editable data editor for descriptions
-            edited = st.data_editor(
-                schema,
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "column_description": st.column_config.TextColumn(
-                        "Column Description", help="Describe the purpose of this column"
-                    )
-                },
-                disabled={c: True for c in schema.columns if c in ["column_name", "data_type"]},
+            edited_schema = st.data_editor(
+                upload_schema_df_for_editor, hide_index=True, width="stretch",
+                column_config={"column_description": st.column_config.TextColumn("Column Description", help="Describe the purpose of this column")},
+                disabled=["table_catalog", "table_schema", "table_name", "column_name", "data_type"],
                 key="schema_editor",
             )
-            st.session_state.schema_df = edited
-            col_enh , col_memadd = st.columns(2)
-            
-            with col_enh:
-                if st.button("Enhance",
-                          icon = "🪄" ,
-                          width="stretch" ,
-                          help="A.I. will populate the column description for you"
-                        ):
-                    st.session_state.schema_df = pd.read_csv("data/sample_schema_with_desc.csv")
-                    st.rerun()
-            
-            with col_memadd:
-                if st.button("Add to memory" , icon="🧠",width="stretch"):
-                    
-                    st.session_state.pick["project"] = prj
-                    st.session_state.pick["dataset"] = dtset
-                    st.session_state.pick["table"] = tbl
-            
-                    add_selected_table(
-                        st.session_state.pick["project"],
-                        st.session_state.pick["dataset"],
-                        st.session_state.pick["table"],
-                        description=st.session_state.smpl_tbl_desc
-                    )
-                    set_ctx_if_ready()
-                    st.rerun()
-            
-            if st.session_state.ctx_set:
-                st.success("Schema ready. You can now generate SQL.", icon="✅")
+            st.session_state.upload_schema_df = edited_schema
 
-    # ---------- Pick a BigQuery table ----------
+            col_enh, col_memadd = st.columns(2)
+            with col_enh:
+                if st.button("Enhance Schema", 
+                             icon="🪄", 
+                             width="stretch", 
+                             help="A.I. will populate the column description for you", 
+                             key="enhance_upload_schema"):
+                    st.session_state.upload_schema_df = pd.read_csv("data/sample_schema_with_desc.csv")
+                    st.rerun()
+            with col_memadd:
+                if st.button("Set as Context", icon="🧠", width="stretch"):
+                    set_context(
+                        project=prj, dataset=dtset, table=tbl,
+                        description=st.session_state.smpl_tbl_desc,
+                        schema_df=edited_schema
+                    )
+                    st.session_state.upload_schema_df = pd.DataFrame() # Clear temp state
+                    # st.session_state.smpl_tbl_desc = ""
+                    st.rerun()
+
     with tab_pick:
         st.subheader("1. Authenticate with Google")
         c1, c2 = st.columns([2, 5], vertical_alignment="center", gap="small")
@@ -262,10 +371,8 @@ def render_ctx_page():
             if st.button("Login to Google", icon="🔑", width="stretch"):
                 st.session_state.auth = True
         with c2:
-            if st.session_state.auth:
-                st.success("Login Successful. You can now access your data warehouse.", icon="✅")
-            else:
-                st.info("Please login to access your data warehouse.", icon="ℹ️")
+            if st.session_state.auth: st.success("Login Successful.", icon="✅")
+            else: st.info("Please login to access your data warehouse.", icon="ℹ️")
 
         st.subheader("2. Choose Project → Dataset → Table")
         if not st.session_state.auth:
@@ -292,75 +399,58 @@ def render_ctx_page():
                 key="pick_project",
                 on_change=lambda: st.session_state.pick.update({"dataset": None, "table": None}),
             )
-            st.session_state.pick["project"] = project or None
+            st.session_state.pick["project"] = project if project else None
 
-            # Datasets
-            datasets = []
-            if project:
-                try:
-                    with st.spinner("Loading datasets..."):
-                        datasets = list_datasets(project)
-                except Forbidden as f:
-                    st.error(f)
-                    st.error(f"Permission denied listing datasets in project `{project}`.")
-                except GoogleAPIError as e:
-                    st.error(f"Error listing datasets: {e}")
-
-            dataset = st.selectbox(
-                "Dataset",
-                options=[""] + datasets,
-                index=0,
-                help="Pick the dataset to work in.",
-                key="pick_dataset",
-                on_change=lambda: st.session_state.pick.update({"table": None}),
-            )
+            datasets = list_datasets(project) if project else []
+            dataset = st.selectbox("Dataset", options=[""] + datasets, index=0, help="Pick the dataset to work in.", key="pick_dataset", on_change=on_dataset_change)
             st.session_state.pick["dataset"] = dataset or None
 
-            # Tables
-            tables = []
-            if project and dataset:
-                try:
-                    with st.spinner("Loading tables..."):
-                        tables = list_tables(project, dataset)
-                except Forbidden:
-                    st.error(f"Permission denied listing tables in `{project}.{dataset}`.")
-                except GoogleAPIError as e:
-                    st.error(f"Error listing tables: {e}")
-
-            table = st.selectbox(
-                "Table",
-                options=[""] + tables,
-                index=0,
-                help="Pick a table to analyze",
-                key="pick_table",
-            )
+            tables = list_tables(project, dataset) if project and dataset else []
+            table = st.selectbox("Table", options=[""] + tables, index=0, help="Pick a table to analyze", key="pick_table")
             st.session_state.pick["table"] = table or None
 
-            can_add = all(st.session_state.pick.values())
-            st.button(
-                "Add table to selection",
-                icon="➕",
-                width="stretch",
-                disabled=not can_add,
-                on_click=lambda: add_selected_table(
-                    st.session_state.pick["project"],
-                    st.session_state.pick["dataset"],
-                    st.session_state.pick["table"],
-                ),
-            )
+            if all(st.session_state.pick.values()):
+                if st.session_state.bq_schema_df.empty or st.session_state.bq_schema_df['table_name'].iloc[0] != table:
+                    st.session_state.bq_schema_df = get_table_schema(project, dataset, table)
+                    st.session_state.bq_table_desc = ""
+                    st.rerun()
 
-            st.caption("**Selected tables:**")
-            if not st.session_state.selected_tables:
-                st.info("No tables selected yet.")
-            else:
-                for i, row in enumerate(st.session_state.selected_tables):
-                    col_a, col_b = st.columns([6, 1])
-                    with col_a:
-                        st.write(f"• `{row['project']}.{row['dataset']}.{row['table']}`")
-                        if row.get("description"):
-                            st.caption(row['description'])
-                    with col_b:
-                        st.button("Remove", key=f"rm_{i}", on_click=remove_selected_table, args=(i,))
+                st.divider()
+                st.subheader("3. Preview & Enhance Context")
+                col_tbldesc, col_enhbtn = st.columns([9, 2], vertical_alignment="center")
+                with col_tbldesc:
+                    st.text_area("Table Description", key="bq_table_desc", placeholder="Add custom description for this table", label_visibility="collapsed")
+                with col_enhbtn:
+                    st.button("Enhance", icon="🪄", width="stretch", help="A.I. will populate the table description for you", on_click=enhance_table_description_llm, key="enhance_bq_tbl_desc")
+
+                if not st.session_state.bq_schema_df.empty:
+                    st.divider()
+                    st.caption("**Table Schema**")
+                    edited_bq_schema = st.data_editor(
+                        st.session_state.bq_schema_df, hide_index=True, width="stretch",
+                        column_config={"column_description": st.column_config.TextColumn("Column Description", help="Describe the purpose of this column")},
+                        disabled=["table_catalog", "table_schema", "table_name", "column_name", "data_type"],
+                        key="bq_schema_editor"
+                    )
+                    st.session_state.bq_schema_df = edited_bq_schema
+                    col_enh, col_memadd = st.columns(2)
+                    with col_enh:
+                        st.button("Enhance Schema", icon="🪄", width="stretch", help="A.I. will populate the column descriptions for you", on_click=enhance_column_descriptions_llm, key="enhance_bq_cols")
+                    with col_memadd:
+                        st.button("Set as Context", icon="🧠", width="stretch", on_click=add_bq_table_to_context)
+
+        st.divider()
+        st.caption("**Current Context:**")
+        if not st.session_state.selected_tables:
+            st.info("No context is set.")
+        else:
+            row = st.session_state.selected_tables[0]
+            col_a, col_b = st.columns([6, 1])
+            with col_a:
+                st.write(f"• `{row['project']}.{row['dataset']}.{row['table']}`")
+                if row.get("description"): st.caption(row['description'])
+            with col_b:
+                st.button("Clear Context", key="clear_ctx_btn", on_click=clear_context)
 
     st.divider()
     if st.button("Return", icon="⬅️", width="stretch"):
@@ -378,11 +468,9 @@ def render_default_page():
     st.markdown("<h2 style='text-align:center;margin-top:0;'>🧐 What are you analyzing today?</h2>", unsafe_allow_html=True)
     st.write("")
 
-    # Chat input (always visible at top)
     with st.container():
         prompt = st.chat_input("Type your requirement and generate the SQL")
         if prompt:
-            # Here you could call your SQL generator later
             st.chat_message("user").write(prompt)
             st.chat_message("assistant").write("I'll generate SQL once the SQL engine is wired up. ✅")
 
@@ -399,11 +487,10 @@ if not st.session_state.ctx_set:
 else:
     st.sidebar.success("Context set", icon="✅")
     if st.session_state.selected_tables:
-        st.sidebar.caption("Tables:")
-        for row in st.session_state.selected_tables:
-            st.sidebar.write(f"- `{row['project']}.{row['dataset']}.{row['table']}`")
-            if row.get("description"):
-                st.sidebar.caption(row['description'])
+        row = st.session_state.selected_tables[0]
+        st.sidebar.write(f"**Table:** `{row['project']}.{row['dataset']}.{row['table']}`")
+        if row.get("description"):
+            st.sidebar.caption(row['description'])
     if not st.session_state.schema_df.empty:
         st.sidebar.caption("Schema: loaded")
 
@@ -412,15 +499,13 @@ if st.sidebar.button("Set Context", icon="🧠", width='stretch'):
     st.rerun()
 
 with st.sidebar.expander("ℹ️ How it works", expanded=False):
-    st.markdown(
-        """
-1. **Authenticate** with Google to enable access to your data warehouse.  
-2. **Set context**: choose **Project → Dataset → Table** in *Set Context* or upload a CSV schema.  
-3. **Ask** in *Generate SQL*: describe what you want to analyze.  
-4. **Review SQL** the assistant drafts using your current selections.  
-5. **Iterate**: refine your prompt or change selections; chat history persists for the session.
-"""
-    )
+    st.markdown("""
+1. **Authenticate** with Google to enable access to your data warehouse.
+2. **Set context**: choose a **single table** via schema upload or the BQ picker. Setting a new context will replace the old one.
+3. **Ask**: Describe what you want to analyze.
+4. **Review**: Check the SQL the assistant drafts for you.
+5. **Iterate**: Refine your prompt or change the context table.
+""")
 
 # =========================
 # Router
@@ -429,5 +514,4 @@ if st.session_state.view == "context":
     render_ctx_page()
 else:
     render_default_page()
-
 
