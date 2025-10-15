@@ -123,7 +123,7 @@ def _init_state():
     ss.setdefault("pick", {"project": None, "dataset": None, "table": None})
     # State for "Upload Schema" tab
     ss.setdefault("smpl_tbl_desc", "")
-    ss.setdefault("upload_schema_df", pd.DataFrame()) # Holds the temporary schema for preview
+    ss.setdefault("upload_schema_df", pd.DataFrame())
     # State for "Pick BQ Table" tab
     ss.setdefault("bq_table_desc", "")
     ss.setdefault("bq_schema_df", pd.DataFrame())
@@ -196,6 +196,16 @@ def enh_smpl_tbl_desc(tbl):
     else:
         tbl_desc = "A sample table description."
     st.session_state.smpl_tbl_desc = tbl_desc
+
+def load_sample_schema():
+    """Callback to load the sample Citibike schema and reset description."""
+    try:
+        st.session_state.upload_schema_df = pd.read_csv("data/sample_schema.csv", dtype=str)
+        # Reset the description in the callback to avoid widget state errors
+        st.session_state.smpl_tbl_desc = ""
+    except FileNotFoundError:
+        st.error("`data/sample_schema.csv` not found. Please create this file for the sample to work.")
+        st.session_state.upload_schema_df = pd.DataFrame()
 
 # --- Gemini Helper Functions ---
 def enhance_table_description_llm():
@@ -344,6 +354,20 @@ You are an expert Google BigQuery SQL writer. Your task is to write a single, sy
         st.error(f"An error occurred while communicating with the AI model: {e}")
         return None
 
+def run_bigquery_query(sql_query: str) -> pd.DataFrame | None:
+    """Executes a BigQuery SQL query and returns the result as a DataFrame."""
+    try:
+        client = get_bq_client()
+        with st.spinner("Executing query in BigQuery..."):
+            query_job = client.query(sql_query)
+            results = query_job.to_dataframe()
+        return results
+    except GoogleAPIError as e:
+        st.error(f"BigQuery Error: {e.message}")
+        return None
+    except Exception as e:
+        st.error(f"An unexpected error occurred while running the query: {e}")
+        return None
 
 # =========================
 # Context Page UI
@@ -367,19 +391,15 @@ def render_ctx_page():
         if uploaded:
             try:
                 st.session_state.upload_schema_df = pd.read_csv(uploaded, dtype=str)
+                # Clear description when new file is uploaded
+                st.session_state.smpl_tbl_desc = ""
             except Exception as e:
                 st.error(f"Failed to read CSV: {e}")
                 st.session_state.upload_schema_df = pd.DataFrame()
 
         st.write("(**or**)")
         st.write("**Use sample schema**")
-        if st.button("NY Citibike trips table schema", icon="🚲"):
-            try:
-                st.session_state.upload_schema_df = pd.read_csv("data/sample_schema.csv", dtype=str)
-                st.session_state.smpl_tbl_desc = ""
-            except FileNotFoundError:
-                st.error("`data/sample_schema.csv` not found. Please create this file for the sample to work.")
-                st.session_state.upload_schema_df = pd.DataFrame()
+        st.button("NY Citibike trips table schema", icon="🚲", on_click=load_sample_schema)
 
         upload_schema_df = st.session_state.upload_schema_df
         if not upload_schema_df.empty:
@@ -424,7 +444,7 @@ def render_ctx_page():
             if c4.button("Set as Context", icon="🧠"):
                 set_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema)
                 st.session_state.upload_schema_df = pd.DataFrame()
-                # st.session_state.smpl_tbl_desc = ""
+                st.session_state.smpl_tbl_desc = ""
                 st.rerun()
 
     with tab_pick:
@@ -533,9 +553,25 @@ def render_default_page():
             break
             
     # Display all messages
-    for msg in st.session_state.messages:
+    for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["display_content"])
+
+            # If the message is a generated SQL query, add a "Run SQL" button and display results
+            if msg.get("type") == "sql":
+                if "query_result" in msg:
+                    st.caption("Query Result:")
+                    st.dataframe(msg["query_result"])
+                elif msg.get("sql_text") and "Unable to generate" not in msg["sql_text"]:
+                    if st.button("🚀 Run SQL", key=f"run_sql_{i}"):
+                        result_df = run_bigquery_query(msg["sql_text"])
+                        if result_df is not None:
+                            if len(result_df) > 10:
+                                st.warning(f"Displaying the first 10 of {len(result_df)} rows.")
+                                st.session_state.messages[i]["query_result"] = result_df.head(10)
+                            else:
+                                st.session_state.messages[i]["query_result"] = result_df
+                            st.rerun()
 
     # If the last message is an unapproved plan, show the Approve button
     if last_plan_idx != -1 and last_plan_idx == len(st.session_state.messages) - 1:
@@ -616,6 +652,7 @@ with st.sidebar.expander("ℹ️ How it works", expanded=False):
 3. **Ask**: Describe what you want to analyze. The AI will propose a plan.
 4. **Refine**: Chat with the AI to edit the plan until you're happy.
 5. **Approve**: Click "Approve Plan" to generate the final SQL query.
+6. **Run**: Execute the generated SQL against BigQuery and see the results.
 """)
 
 # =========================
@@ -625,3 +662,4 @@ if st.session_state.view == "context":
     render_ctx_page()
 else:
     render_default_page()
+
