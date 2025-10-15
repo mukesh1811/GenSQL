@@ -1,0 +1,16 @@
+table_catalog,table_schema,table_name,column_name,data_type,column_description
+bigquery-public-data,new_york,citibike_trips,tripduration,INT64,Duration of the trip in seconds.
+bigquery-public-data,new_york,citibike_trips,starttime,TIMESTAMP,The date and time the trip began.
+bigquery-public-data,new_york,citibike_trips,stoptime,TIMESTAMP,The date and time the trip ended.
+bigquery-public-data,new_york,citibike_trips,start_station_id,INT64,Unique identifier of the starting station.
+bigquery-public-data,new_york,citibike_trips,start_station_name,STRING,Name of the starting station.
+bigquery-public-data,new_york,citibike_trips,start_station_latitude,FLOAT64,Latitude of the starting station.
+bigquery-public-data,new_york,citibike_trips,start_station_longitude,FLOAT64,Longitude of the starting station.
+bigquery-public-data,new_york,citibike_trips,end_station_id,INT64,Unique identifier of the ending station.
+bigquery-public-data,new_york,citibike_trips,end_station_name,STRING,Name of the ending station.
+bigquery-public-data,new_york,citibike_trips,end_station_latitude,FLOAT64,Latitude of the ending station.
+bigquery-public-data,new_york,citibike_trips,end_station_longitude,FLOAT64,Longitude of the ending station.
+bigquery-public-data,new_york,citibike_trips,bikeid,INT64,Unique identifier of the bicycle used for the trip.
+bigquery-public-data,new_york,citibike_trips,usertype,STRING,"Type of user (e.g., Subscriber or Customer)."
+bigquery-public-data,new_york,citibike_trips,birth_year,INT64,Year of birth of the rider.
+bigquery-public-data,new_york,citibike_trips,gender,STRING,Gender of the rider (0=Unknown; 1=Male; 2=Female).
