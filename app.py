@@ -122,6 +122,8 @@ def _init_state():
     # State for "Pick BQ Table" tab
     ss.setdefault("bq_table_desc", "")
     ss.setdefault("bq_schema_df", pd.DataFrame())
+    # State for chat messages
+    ss.setdefault("messages", [])
 
 
 _init_state()
