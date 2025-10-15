@@ -369,6 +369,54 @@ def run_bigquery_query(sql_query: str) -> pd.DataFrame | None:
         st.error(f"An unexpected error occurred while running the query: {e}")
         return None
 
+def suggest_chart_llm(user_prompt: str, sql_query: str, result_df: pd.DataFrame):
+    """Analyzes a query result and suggests a suitable chart type."""
+    if result_df.empty or len(result_df.columns) < 2:
+        return {"chart_type": "none", "x_axis": None, "y_axis": None, "title": None}
+
+    model = get_model()
+    data_preview = result_df.head().to_string()
+    
+    prompt = f"""
+You are a data visualization expert. Based on the user's question, the SQL query, and a preview of the result data, determine the most suitable type of chart to visualize the answer.
+
+**User's Question:** "{user_prompt}"
+
+**SQL Query:**
+```sql
+{sql_query}
+```
+
+**Data Preview (first 5 rows):**
+```
+{data_preview}
+```
+
+**Instructions:**
+1.  Analyze the data's structure (column names, number of columns, data types). A numeric column is generally required for the y-axis. A categorical or temporal column is best for the x-axis.
+2.  Consider the user's intent (e.g., comparison, trend over time, distribution).
+3.  Choose one of the following chart types: 'bar', 'line', 'area', 'scatter', or 'none'.
+4.  If you choose a chart type other than 'none', you MUST identify the best columns for the 'x_axis' and 'y_axis' from the data preview.
+5.  Provide a descriptive title for the chart.
+6.  Return a single JSON object with the following keys: "chart_type", "x_axis", "y_axis", "title". If no chart is suitable, `chart_type` must be "none".
+
+**JSON Output:**
+"""
+    try:
+        response = model.generate_content(prompt)
+        json_str = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+        
+        try:
+            chart_info = json.loads(json_str)
+            if "chart_type" in chart_info:
+                return chart_info
+            return {"chart_type": "none", "x_axis": None, "y_axis": None, "title": None}
+        except json.JSONDecodeError:
+            return {"chart_type": "none", "x_axis": None, "y_axis": None, "title": None}
+            
+    except Exception:
+        return {"chart_type": "none", "x_axis": None, "y_axis": None, "title": None}
+
 # =========================
 # Context Page UI
 # =========================
@@ -557,20 +605,62 @@ def render_default_page():
         with st.chat_message(msg["role"]):
             st.markdown(msg["display_content"])
 
-            # If the message is a generated SQL query, add a "Run SQL" button and display results
             if msg.get("type") == "sql":
                 if "query_result" in msg:
                     st.caption("Query Result:")
                     st.dataframe(msg["query_result"])
+                    
+                    if msg.get("chart_created"):
+                        st.caption("Chart:")
+                        chart_info = msg["chart_suggestion"]
+                        chart_df = msg["full_query_result"] # Use full result for charting
+                        
+                        # Verify columns exist before trying to chart
+                        if chart_info["x_axis"] in chart_df.columns and chart_info["y_axis"] in chart_df.columns:
+                            # Streamlit charts often work best with the x-axis set as the index
+                            chart_df_indexed = chart_df.set_index(chart_info["x_axis"])
+                            chart_type = chart_info["chart_type"]
+                            
+                            st.write(f"**{chart_info.get('title', 'Generated Chart')}**")
+
+                            if chart_type == "bar": st.bar_chart(chart_df_indexed[[chart_info["y_axis"]]])
+                            elif chart_type == "line": st.line_chart(chart_df_indexed[[chart_info["y_axis"]]])
+                            elif chart_type == "area": st.area_chart(chart_df_indexed[[chart_info["y_axis"]]])
+                            # Scatter doesn't use the index, so pass x and y
+                            elif chart_type == "scatter": st.scatter_chart(chart_df, x=chart_info["x_axis"], y=chart_info["y_axis"])
+                        else:
+                            st.error("Chart generation failed: columns suggested by AI were not found in the result.")
+
+                    elif "chart_suggestion" in msg and msg["chart_suggestion"]["chart_type"] != "none":
+                        chart_info = msg["chart_suggestion"]
+                        chart_type_str = chart_info['chart_type'].capitalize()
+                        if st.button(f"📊 Create {chart_type_str} Chart", key=f"create_chart_{i}"):
+                            st.session_state.messages[i]["chart_created"] = True
+                            st.rerun()
+
                 elif msg.get("sql_text") and "Unable to generate" not in msg["sql_text"]:
                     if st.button("🚀 Run SQL", key=f"run_sql_{i}"):
                         result_df = run_bigquery_query(msg["sql_text"])
                         if result_df is not None:
+                            st.session_state.messages[i]["full_query_result"] = result_df # Store full result
+                            
+                            # Determine the preview dataframe (head(10))
                             if len(result_df) > 10:
                                 st.warning(f"Displaying the first 10 of {len(result_df)} rows.")
                                 st.session_state.messages[i]["query_result"] = result_df.head(10)
                             else:
                                 st.session_state.messages[i]["query_result"] = result_df
+                            
+                            # Suggest chart based on the full result
+                            with st.spinner("Analyzing result for chart suggestion..."):
+                                original_prompt = ""
+                                for j in range(i, -1, -1):
+                                    if st.session_state.messages[j]["role"] == "user":
+                                        original_prompt = st.session_state.messages[j]["content"]
+                                        break
+                                chart_suggestion = suggest_chart_llm(original_prompt, msg["sql_text"], result_df)
+                                if chart_suggestion:
+                                    st.session_state.messages[i]["chart_suggestion"] = chart_suggestion
                             st.rerun()
 
     # If the last message is an unapproved plan, show the Approve button
@@ -653,6 +743,7 @@ with st.sidebar.expander("ℹ️ How it works", expanded=False):
 4. **Refine**: Chat with the AI to edit the plan until you're happy.
 5. **Approve**: Click "Approve Plan" to generate the final SQL query.
 6. **Run**: Execute the generated SQL against BigQuery and see the results.
+7. **Visualize**: If applicable, click "Create Chart" to see a visual representation of your data.
 """)
 
 # =========================
@@ -662,4 +753,3 @@ if st.session_state.view == "context":
     render_ctx_page()
 else:
     render_default_page()
-
