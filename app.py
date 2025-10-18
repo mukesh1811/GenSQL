@@ -131,6 +131,9 @@ def _init_state():
     # State for "Pick BQ Table" tab
     ss.setdefault("bq_table_desc", "")
     ss.setdefault("bq_schema_df", pd.DataFrame())
+    # Context Whisperer suggestions: list of exactly 3 short strings and a "for" key to track table
+    ss.setdefault("ctx_suggestions", [])
+    ss.setdefault("ctx_suggestions_for", None)
     # State for chat messages and flow control
     ss.setdefault("messages", [])
     ss.setdefault("current_plan_approved", False)
@@ -177,6 +180,13 @@ def add_bq_table_to_context():
         description=st.session_state.bq_table_desc,
         schema_df=st.session_state.bq_schema_df
     )
+    # Remember which table the suggestions were generated for (if any) so they persist with the context
+    proj = st.session_state.pick.get("project")
+    dset = st.session_state.pick.get("dataset")
+    tbl = st.session_state.pick.get("table")
+    if proj and dset and tbl:
+        st.session_state.ctx_suggestions_for = f"{proj}.{dset}.{tbl}"
+
     st.session_state.bq_schema_df = pd.DataFrame()
     st.session_state.bq_table_desc = ""
     st.rerun()
@@ -295,6 +305,87 @@ def _get_llm_context():
 - Table Schema:
 {schema_str}
 """
+
+def generate_context_suggestions_llm():
+    """Generates exactly 3 short, conversational, click-ready suggestions based on the current context schema.
+
+    Suggestions are intended to be injected as user messages and trigger plan generation.
+    """
+    # Lightweight guard
+    if not st.session_state.selected_tables or st.session_state.schema_df.empty:
+        return []
+
+    table_info = st.session_state.selected_tables[0]
+    project = table_info['project']
+    dataset = table_info['dataset']
+    table = table_info['table']
+
+    # Build a short schema preview
+    schema_preview = "; ".join([f"{r.column_name} ({r.data_type})" for _, r in st.session_state.schema_df.head(10).iterrows()])
+
+    prompt = f"""
+You are a helpful assistant called the Context Whisperer. Given a BigQuery table identified as {project}.{dataset}.{table} and a short preview of its schema, generate exactly 3 concise, conversational suggestions the user might ask next. Each suggestion should be 6 words or fewer, click-ready, and phrased as a user question or instruction (e.g., "Show top 10 users by spend").
+
+Schema preview: {schema_preview}
+
+Return the suggestions as plain text, one per line, no numbering, no extra commentary.
+"""
+    try:
+        model = get_model()
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        # Split into lines and keep first 3 short suggestions
+        lines = [l.strip().strip('-').strip() for l in text.splitlines() if l.strip()]
+        suggestions = []
+        for l in lines:
+            if len(suggestions) >= 3:
+                break
+            # ensure brevity
+            if len(l.split()) > 12:
+                l = " ".join(l.split()[:12])
+            suggestions.append(l)
+        # Pad or trim to exactly 3
+        while len(suggestions) < 3:
+            suggestions.append("Ask for a summary of the table")
+        return suggestions[:3]
+    except Exception:
+        # Fallback lightweight defaults
+        return [
+            "Show top 10 rows",
+            "Summarize key columns",
+            "What are common joins?"
+        ]
+
+
+def _render_ctx_suggestions_box():
+    """Renders the 3 suggestion chips and handles clicks.
+
+    Clicking injects the suggestion into the chat flow and immediately generates a plan.
+    """
+    suggestions = st.session_state.get("ctx_suggestions", [])
+    if not suggestions:
+        return
+
+    st.caption("Context Whisperer — suggestions")
+    cols = st.columns(len(suggestions))
+    for idx, (col, text) in enumerate(zip(cols, suggestions)):
+        if col.button(text, key=f"ctx_sugg_{idx}"):
+            # Simulate user typing this and immediately produce AI plan
+            st.session_state.messages.append({"role": "user", "display_content": text, "content": text})
+            # Generate plan immediately
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    conversation_text = build_llm_conversation_text(st.session_state.messages)
+                    new_plan_text = generate_plan_llm(conversation_text)
+                    if new_plan_text:
+                        display_content = f"**Here is the proposed plan:**\n\n{new_plan_text}"
+                        st.session_state.messages.append({
+                            "role": "assistant", "type": "plan",
+                            "plan_text": new_plan_text, "display_content": display_content,
+                            "approved": False
+                        })
+            st.rerun()
+
 
 def generate_plan_llm(conversation_text: str):
     """Generates a plan based on the conversation history."""
@@ -536,6 +627,13 @@ def render_ctx_page():
                 if st.session_state.bq_schema_df.empty or st.session_state.bq_schema_df['table_name'].iloc[0] != table:
                     st.session_state.bq_schema_df = get_table_schema(project, dataset, table)
                     st.session_state.bq_table_desc = ""
+                    # Generate lightweight context suggestions for this table
+                    try:
+                        suggestions = generate_context_suggestions_llm()
+                        st.session_state.ctx_suggestions = suggestions
+                        st.session_state.ctx_suggestions_for = f"{project}.{dataset}.{table}"
+                    except Exception:
+                        st.session_state.ctx_suggestions = []
                     st.rerun()
 
                 st.divider()
@@ -592,6 +690,8 @@ def render_default_page():
     if not st.session_state.ctx_set:
         st.warning("Context not set. Please set context in the sidebar to proceed.", icon="⚠️")
         return
+
+    # (Suggestions will be shown just above the chat input.)
 
     st.markdown("<h2 style='text-align:center;margin-top:0;'>🧐 What are you analyzing today?</h2>", unsafe_allow_html=True)
     st.write("")
@@ -692,6 +792,15 @@ def render_default_page():
                             "sql_text": sql_code, "display_content": display_content
                         })
             st.rerun()
+
+    # Show Context Whisperer suggestions just above the chat input when available
+    if st.session_state.ctx_set and st.session_state.get("ctx_suggestions"):
+        current = None
+        if st.session_state.selected_tables:
+            r = st.session_state.selected_tables[0]
+            current = f"{r['project']}.{r['dataset']}.{r['table']}"
+        if st.session_state.ctx_suggestions_for == current:
+            _render_ctx_suggestions_box()
 
     # Chat input logic
     is_mid_conversation = last_plan_idx != -1 and last_plan_idx == len(st.session_state.messages) - 1
