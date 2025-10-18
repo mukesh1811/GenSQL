@@ -1,4 +1,8 @@
 # gcloud auth application-default login
+# gcloud auth application-default set-quota-project learning-prj-id
+# gcloud auth application-default set-quota-project aeo-supplychain-datamart-prod
+
+
 
 import pandas as pd
 import streamlit as st
@@ -492,7 +496,7 @@ def render_ctx_page():
             if c4.button("Set as Context", icon="🧠"):
                 set_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema)
                 st.session_state.upload_schema_df = pd.DataFrame()
-                st.session_state.smpl_tbl_desc = ""
+                # st.session_state.smpl_tbl_desc = ""
                 st.rerun()
 
     with tab_pick:
