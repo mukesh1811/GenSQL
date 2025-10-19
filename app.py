@@ -421,6 +421,94 @@ You are a data visualization expert. Based on the user's question, the SQL query
     except Exception:
         return {"chart_type": "none", "x_axis": None, "y_axis": None, "title": None}
 
+
+def summarize_query_result_llm(result_df: pd.DataFrame, user_question: str | None = None) -> str:
+    """Summarize the given DataFrame using the Gemini model (one key insight in plain English).
+
+    The summarizer now considers the original user question (if provided) so the insight
+    is relevant to the user's intent rather than a random observation.
+
+    If the LLM call fails or Vertex AI is not available, fall back to a simple heuristic summary
+    that also references the user's question when possible.
+    """
+    if result_df is None or result_df.empty:
+        return "No data available to summarize."
+
+    # Prepare a compact preview to send to the model (limit rows & columns)
+    try:
+        preview = result_df.head(20).copy()
+        # show dtypes and a small sample
+        schema_lines = []
+        for col in preview.columns:
+            schema_lines.append(f"- {col}: {str(preview[col].dtype)}")
+        preview_str = preview.to_csv(index=False)
+
+        # Include the user's question in the prompt when available so the AI focuses on that intent
+        user_q_section = f"User's question: {user_question}\n\n" if user_question else ""
+
+        prompt = f"""
+You are a data analyst. Given a preview of a query result (up to 20 rows), the column types, and the user's question (if provided), provide ONE key insight that best answers or relates to the user's intent.
+
+Include a one-sentence summary that states the most important/high-level insight. Keep it short and do not include any code or extra formatting.
+
+{user_q_section}Column types:
+{chr(10).join(schema_lines)}
+
+Data preview (CSV):
+{preview_str}
+
+Insight:
+"""
+
+        model = get_model()
+        with st.spinner("Generating summary from AI..."):
+            try:
+                response = model.generate_content(prompt)
+                summary = response.text.strip()
+                # Keep it compact
+                return summary
+            except Exception as e:
+                # Fall through to heuristic fallback
+                st.warning(f"AI summarization failed, using local fallback: {e}")
+    except Exception as e:
+        # If preparing the prompt failed, fall back
+        st.warning(f"Failed to prepare data for summarization: {e}")
+
+    # Heuristic fallback: simple statistics-based insight
+    try:
+        numeric_cols = result_df.select_dtypes(include=["number"]).columns.tolist()
+        if numeric_cols:
+            # pick column with largest std dev as potentially most interesting
+            stds = result_df[numeric_cols].std(numeric_only=True)
+            col = stds.idxmax()
+            mean = result_df[col].mean()
+            minimum = result_df[col].min()
+            maximum = result_df[col].max()
+            base_summary = (
+                f"The numeric column '{col}' shows the largest variation (std={stds[col]:.2f}) among numeric fields. "
+                f"Its values range from {minimum:.2f} to {maximum:.2f} with an average of {mean:.2f}."
+            )
+            if user_question:
+                return f"Key insight related to your question ('{user_question}'): {base_summary}"
+            return f"Key insight: {base_summary}"
+
+        # If no numeric columns, look for high-cardinality categorical column or most frequent value
+        else:
+            cols = result_df.columns.tolist()
+            # choose first column and give a frequency-based insight
+            col = cols[0]
+            top = result_df[col].mode()
+            if not top.empty:
+                top_val = top.iloc[0]
+                freq = result_df[col].value_counts().iloc[0]
+                base_summary = f"In column '{col}', the most common value is '{top_val}' (appears {freq} times in the preview)."
+                if user_question:
+                    return f"Key insight related to your question ('{user_question}'): {base_summary}"
+                return f"Key insight: {base_summary}"
+    except Exception as e:
+        return f"Could not generate a summary due to an error: {e}"
+
+
 # =========================
 # Context Page UI
 # =========================
@@ -613,6 +701,25 @@ def render_default_page():
                 if "query_result" in msg:
                     st.caption("Query Result:")
                     st.dataframe(msg["query_result"])
+
+                    # If a summary was previously generated for this result, display it
+                    if "summary" in msg:
+                        st.info(msg["summary"])
+
+                    # Summarize button: analyze the full result (or preview) and return one key insight
+                    if st.button("📝 Summarize", key=f"summarize_{i}"):
+                        full_df = msg.get("full_query_result", msg.get("query_result"))
+                        # Attempt to find the original user question that led to this SQL/result
+                        original_prompt = ""
+                        for j in range(i, -1, -1):
+                            if st.session_state.messages[j]["role"] == "user":
+                                original_prompt = st.session_state.messages[j]["content"]
+                                break
+                        summary_text = summarize_query_result_llm(full_df, user_question=original_prompt)
+                        st.session_state.messages[i]["summary"] = summary_text
+                        with st.chat_message("assistant"):
+                            st.info(summary_text)
+                        st.rerun()
                     
                     if msg.get("chart_created"):
                         st.caption("Chart:")
