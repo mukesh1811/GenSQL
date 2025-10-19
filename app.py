@@ -679,9 +679,14 @@ def build_llm_conversation_text(messages_list):
 def render_default_page():
     if not st.session_state.ctx_set:
         st.warning("Context not set. Please set context in the sidebar to proceed.", icon="⚠️")
-        return
+        # return
 
     st.markdown("<h2 style='text-align:center;margin-top:0;'>🧐 What are you analyzing today?</h2>", unsafe_allow_html=True)
+    
+    if not st.session_state.ctx_set:
+        st.chat_input("Set context to start analyzing your data.", disabled=True)
+        return
+    
     st.write("")
 
     # Find the index of the last message that is an unapproved plan
