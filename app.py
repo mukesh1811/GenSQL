@@ -755,29 +755,59 @@ def render_default_page():
                             st.rerun()
 
                 elif msg.get("sql_text") and "Unable to generate" not in msg["sql_text"]:
-                    if st.button("🚀 Run SQL", key=f"run_sql_{i}"):
-                        result_df = run_bigquery_query(msg["sql_text"])
-                        if result_df is not None:
-                            st.session_state.messages[i]["full_query_result"] = result_df # Store full result
-                            
-                            # Determine the preview dataframe (head(10))
-                            if len(result_df) > 10:
-                                st.warning(f"Displaying the first 10 of {len(result_df)} rows.")
-                                st.session_state.messages[i]["query_result"] = result_df.head(10)
-                            else:
-                                st.session_state.messages[i]["query_result"] = result_df
-                            
-                            # Suggest chart based on the full result
-                            with st.spinner("Analyzing result for chart suggestion..."):
-                                original_prompt = ""
-                                for j in range(i, -1, -1):
-                                    if st.session_state.messages[j]["role"] == "user":
-                                        original_prompt = st.session_state.messages[j]["content"]
-                                        break
-                                chart_suggestion = suggest_chart_llm(original_prompt, msg["sql_text"], result_df)
-                                if chart_suggestion:
-                                    st.session_state.messages[i]["chart_suggestion"] = chart_suggestion
+                    # Support manual editing of the SQL before running
+                    # If the message is in edit mode, show the editor + Update/Cancel
+                    if msg.get("editable"):
+                        # Provide a multiline editor pre-filled with edited_sql or sql_text
+                        current_sql = msg.get("edited_sql", msg.get("sql_text", ""))
+                        edited = st.text_area("Edit SQL", value=current_sql, key=f"manual_sql_editor_{i}", height=220)
+                        c_upd, c_can = st.columns([1, 1])
+                        if c_upd.button("Update", key=f"update_sql_{i}"):
+                            # Save the edited SQL back to the message and exit edit mode
+                            st.session_state.messages[i]["sql_text"] = edited
+                            st.session_state.messages[i]["display_content"] = f"**Generated SQL:**\n```sql\n{edited}\n```"
+                            # clear edit state
+                            st.session_state.messages[i].pop("editable", None)
+                            st.session_state.messages[i].pop("edited_sql", None)
                             st.rerun()
+                        if c_can.button("Cancel", key=f"cancel_edit_{i}"):
+                            # Discard edits and exit edit mode
+                            st.session_state.messages[i].pop("editable", None)
+                            st.session_state.messages[i].pop("edited_sql", None)
+                            st.rerun()
+                        # Keep the edited value in session so it persists while typing
+                        st.session_state.messages[i]["edited_sql"] = edited
+                    else:
+                        # Not in edit mode: show Manual Edit and Run buttons side-by-side
+                        c_run, c_edit = st.columns([1, 1])
+                        if c_edit.button("✏️ Manual Edit", key=f"manual_edit_{i}"):
+                            st.session_state.messages[i]["editable"] = True
+                            st.session_state.messages[i]["edited_sql"] = msg.get("sql_text", "")
+                            st.rerun()
+
+                        if c_run.button("🚀 Run SQL", key=f"run_sql_{i}"):
+                            result_df = run_bigquery_query(msg["sql_text"])
+                            if result_df is not None:
+                                st.session_state.messages[i]["full_query_result"] = result_df # Store full result
+                                
+                                # Determine the preview dataframe (head(10))
+                                if len(result_df) > 10:
+                                    st.warning(f"Displaying the first 10 of {len(result_df)} rows.")
+                                    st.session_state.messages[i]["query_result"] = result_df.head(10)
+                                else:
+                                    st.session_state.messages[i]["query_result"] = result_df
+                                
+                                # Suggest chart based on the full result
+                                with st.spinner("Analyzing result for chart suggestion..."):
+                                    original_prompt = ""
+                                    for j in range(i, -1, -1):
+                                        if st.session_state.messages[j]["role"] == "user":
+                                            original_prompt = st.session_state.messages[j]["content"]
+                                            break
+                                    chart_suggestion = suggest_chart_llm(original_prompt, msg["sql_text"], result_df)
+                                    if chart_suggestion:
+                                        st.session_state.messages[i]["chart_suggestion"] = chart_suggestion
+                                st.rerun()
 
     # If the last message is an unapproved plan, show the Approve button
     if last_plan_idx != -1 and last_plan_idx == len(st.session_state.messages) - 1:
