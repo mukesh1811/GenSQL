@@ -313,10 +313,11 @@ You are an expert Google BigQuery SQL analyst. Your task is to create a step-by-
 
 **Instructions:**
 1. Analyze the latest user request in the context of the full conversation.
-2. Generate a new, concise, step-by-step plan. If a previous plan exists, refine it based on the user's latest feedback.
-3. The plan should be clear and easy to understand.
-4. If the question cannot be answered using the schema, the plan must state why.
-5. Output **only the plan text**, as a numbered or bulleted list. Do not include any preamble, titles, or markdown formatting.
+2. Clearly state the goal of the analysis in one concise sentence before listing the steps.
+3. Generate a new, concise, step-by-step plan. If a previous plan exists, refine it based on the user's latest feedback.
+4. The plan should be clear and easy to understand.
+5. If the question cannot be answered using the schema, the plan must explicitly state why.
+6. Output only the goal statement and the plan, with the goal as a sentence followed by a numbered or bulleted list. Do not include any preamble, titles, or markdown formatting.
 """
     try:
         response = model.generate_content(prompt)
@@ -849,7 +850,7 @@ def render_default_page():
                 new_plan_text = generate_plan_llm(conversation_text)
 
                 if new_plan_text:
-                    display_content = f"**Here is the proposed plan:**\n\n{new_plan_text}"
+                    display_content = f"**Here is the goal and proposed plan:**\n\n{new_plan_text}"
                     st.session_state.messages.append({
                         "role": "assistant", "type": "plan",
                         "plan_text": new_plan_text, "display_content": display_content,
