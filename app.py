@@ -566,7 +566,11 @@ def render_ctx_page():
 
             c1, c2 = st.columns([9, 2])
             c1.text_area("Table Description", key="smpl_tbl_desc", placeholder="Add custom description for this table", label_visibility="collapsed")
-            c2.button("Enhance", icon="🪄", help="A.I. will populate the table description for you", on_click=enh_smpl_tbl_desc, args=[tbl])
+            c2.button("Enhance", 
+                      icon="🪄", help="A.I. will populate the table description for you", 
+                      on_click=enh_smpl_tbl_desc,
+                      key="enhance_upload_tbl_desc",
+                      args=[tbl])
 
             st.divider()
             st.caption("**Table Schema**")
@@ -582,7 +586,7 @@ def render_ctx_page():
             if c3.button("Enhance Schema", icon="🪄", help="A.I. will populate the column description for you", key="enhance_upload_schema"):
                 st.session_state.upload_schema_df = pd.read_csv("data/sample_schema_with_desc.csv")
                 st.rerun()
-            if c4.button("Set as Context", icon="🧠"):
+            if c4.button("Set as Context", icon="🧠", key="set_context_upload_btn"):
                 set_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema)
                 st.session_state.upload_schema_df = pd.DataFrame()
                 # st.session_state.smpl_tbl_desc = ""
@@ -625,13 +629,17 @@ def render_ctx_page():
                 if st.session_state.bq_schema_df.empty or st.session_state.bq_schema_df['table_name'].iloc[0] != table:
                     st.session_state.bq_schema_df = get_table_schema(project, dataset, table)
                     st.session_state.bq_table_desc = ""
-                    st.rerun()
+                    # st.rerun()
 
                 st.divider()
                 st.subheader("3. Preview & Enhance Context")
                 c1, c2 = st.columns([9, 2])
                 c1.text_area("Table Description", key="bq_table_desc", placeholder="Add custom description for this table", label_visibility="collapsed")
-                c2.button("Enhance", icon="🪄", help="A.I. will populate table description", on_click=enhance_table_description_llm, key="enhance_bq_tbl_desc")
+                c2.button("Enhance", icon="🪄", 
+                          help="A.I. will populate table description", 
+                          on_click=enhance_table_description_llm, 
+                          key="enhance_bq_tbl_desc"
+                          )
 
                 if not st.session_state.bq_schema_df.empty:
                     st.divider()
@@ -645,7 +653,7 @@ def render_ctx_page():
                     st.session_state.bq_schema_df = edited_bq_schema
                     c3, c4 = st.columns(2)
                     c3.button("Enhance Schema", icon="🪄", help="A.I. will populate column descriptions", on_click=enhance_column_descriptions_llm, key="enhance_bq_cols")
-                    c4.button("Set as Context", icon="🧠", on_click=add_bq_table_to_context)
+                    c4.button("Set as Context", icon="🧠", on_click=add_bq_table_to_context, key="set_context_bq_btn")
 
     st.divider()
     st.caption("**Current Context:**")
