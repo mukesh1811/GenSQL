@@ -1,6 +1,12 @@
+## auth
+# gcloud auth login
 # gcloud auth application-default login
-# gcloud auth application-default set-quota-project learning-prj-id
+
+## set project
+# gcloud config set project aeo-supplychain-datamart-prod
 # gcloud auth application-default set-quota-project aeo-supplychain-datamart-prod
+
+# gcloud auth application-default set-quota-project learning-prj-id
 
 
 
@@ -315,7 +321,7 @@ You are an expert Google BigQuery SQL analyst. Your task is to create a step-by-
 1. Analyze the latest user request in the context of the full conversation.
 2. Clearly state the goal of the analysis in one concise sentence before listing the steps.
 3. Generate a new, concise, step-by-step plan. If a previous plan exists, refine it based on the user's latest feedback.
-4. The plan should be clear and easy to understand.
+4. The plan should be clear, unambiguous and easy to understand.
 5. If the question cannot be answered using the schema, the plan must explicitly state why.
 6. Output only the goal statement and the plan, with the goal as a sentence followed by a numbered or bulleted list. Do not include any preamble, titles, or markdown formatting.
 """
@@ -687,7 +693,12 @@ def build_llm_conversation_text(messages_list):
 
 def render_default_page():
     if not st.session_state.ctx_set:
-        st.warning("Context not set. Please set context in the sidebar to proceed.", icon="⚠️")
+        st.markdown(
+            "<div style='background-color:#fff3cd;border:1px solid #ffeeba;color:#856404;padding:12px;border-radius:4px;text-align:center;'>"
+            "<span style='font-size:1.05em;'>⚠️ Context not set. Please set context in the left sidebar to proceed.</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         # return
 
     st.markdown("<h2 style='text-align:center;margin-top:0;'>🧐 What are you analyzing today?</h2>", unsafe_allow_html=True)
@@ -871,7 +882,7 @@ def render_default_page():
 # Sidebar UI
 # =========================
 st.sidebar.title("F.R.I.D.A.Y")
-st.sidebar.caption("AI-Powered SQL Analytics Assistant")
+st.sidebar.caption("AI-Powered Analytics Assistant")
 
 st.sidebar.title("Context")
 if not st.session_state.ctx_set:
@@ -890,7 +901,7 @@ if st.sidebar.button("Set/Change Context", icon="🧠", use_container_width=True
     st.session_state.view = "context"
     st.rerun()
 
-with st.sidebar.expander("ℹ️ How it works", expanded=False):
+with st.sidebar.expander("ℹ️ How it works", expanded=True):
     st.markdown("""
 1. **Authenticate** with Google to enable access to your data warehouse.
 2. **Set context**: choose a **single table** via schema upload or the BQ picker.
