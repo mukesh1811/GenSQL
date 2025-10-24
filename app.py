@@ -6,6 +6,10 @@
 # gcloud config set project aeo-supplychain-datamart-prod
 # gcloud auth application-default set-quota-project aeo-supplychain-datamart-prod
 
+## set project
+# gcloud config set project learning-prj-id
+# gcloud auth application-default set-quota-project learning-prj-id
+
 # gcloud auth application-default set-quota-project learning-prj-id
 
 

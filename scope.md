@@ -7,10 +7,13 @@
     - conversation analytics
     - layman - chatgpt for enterprise data
     - vision is to empower data professionals to get to insights faster while staying in the investigative flow rather than juggling between tools and programming languages
+    - just a hands on pitch, not the product
+    - last time we saw how a data professional can go from question to insight, faster, easier while staying in the flow
+    - today, CONTEXT / The Brain
 
-- what do you think
 
-- just 2 weeks left
+- just 1 weeks left
+- did not get to speak more in previous meeting
 - i'd like two favours from you
     - AE collab
         - too early as a product yet we see value for AE already
@@ -21,63 +24,38 @@
         - I would really want you to invest. money is important. but other than that you being invested at this early stage, your feedback, guidance and expertise will be too valuable. it will be too much fun
 
 
-
-
-- how much web lost sales would have been converted if all boss inventory was made available?
-- if all the stores were on BOSS how much of web lost sales would have reduced? show me as a percentage of current web lost sales
-- chatgpt to enterprise date
-- extremely scrappy
-- pain points
-    - data / context
-    - switch to multiple tools
-- just a better alternative to verbal pitching
-
-    - pain points
-        - data / context
-        - switch to multiple tools
-    - solution
-        - org wide context
-        - AI powered planning assistant
-        - Query agent
-        - visualization agent
-- limitations
-    - only 3 tables
-    - only two chart types
-    - limited export
+# 29th Oct 2025
+- [ ] context ui
+- [ ] Global context
+- [ ] retrieval
+- [ ] local context
+- [ ] multi table
 
 # 22nd Oct 2025
 
 - [ ] selected tables and columns in the plan
 - [ ] FRIDAY sidebar subtext - slider - mom, intermediate, manager
 - [ ] fix SQL
+    - [ ] auto fix
+    - [ ] unidentified - #debug
 - [ ] UX
-    - [ ] context pre set
-    - [ ] show context
-    - [ ] edit context
     - [ ] "suggested chart types"
-- [ ] load project, dataset and tables from pre downloaded csv
 - [ ] stress test ls_with_boss and lost_sales_root_cause_analysis
 - [ ] multi sql plan
 
-# P0
+# P_m1
 
 - [ ] Set context
     - [X] Upload Schema
         - [X] add help
     - [X] use sample - NYC Citibike trips
     - [X] pick bigquery table (max 3)
-    - [ ] add table description
-    - [ ] auto populate column description
+    - [X] add table description
+    - [X] auto populate column description
     - [ ] rag
-- [ ] analyze
-    - [ ] ask question
-    - [ ] get plan
-    - [ ] vibe edit plan
-    - [ ] get query
-    - [ ] vibe edit generated sql
-
-# P1
-**features**
-- [ ] context mcp
-
-# P2
+- [X] analyze
+    - [X] ask question
+    - [X] get plan
+    - [X] vibe edit plan
+    - [X] get query
+    - [X] vibe edit generated sql
