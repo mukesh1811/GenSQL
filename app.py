@@ -10,8 +10,6 @@
 # gcloud config set project learning-prj-id
 # gcloud auth application-default set-quota-project learning-prj-id
 
-# gcloud auth application-default set-quota-project learning-prj-id
-
 
 
 import pandas as pd
@@ -258,29 +256,139 @@ def enhance_column_descriptions_llm():
         st.warning("Please select a valid table first.")
         return
 
+    client = get_bq_client()
+
+    # Collect lightweight summaries for each column to inform the LLM and to append to descriptions
+    summaries = {}
+    for _, row in schema_df.iterrows():
+        col = row['column_name']
+        dtype = (row.get('data_type') or '').upper()
+        col_back = f"`{col}`"
+        table_fq = f"`{project}.{dataset}.{table}`"
+
+        # Build a small targeted query depending on data type
+        if any(t in dtype for t in ['STRING', 'BYTES', 'CHAR']):
+            qry = f"SELECT ARRAY_AGG(DISTINCT {col_back} ORDER BY {col_back} LIMIT 10) AS distinct_vals, COUNT(DISTINCT {col_back}) AS distinct_count FROM {table_fq} WHERE {col_back} IS NOT NULL"
+        elif any(t in dtype for t in ['DATE', 'TIMESTAMP', 'DATETIME']):
+            qry = f"SELECT MIN({col_back}) AS min_val, MAX({col_back}) AS max_val FROM {table_fq} WHERE {col_back} IS NOT NULL"
+        elif any(t in dtype for t in ['INT', 'INTEGER', 'NUMERIC', 'FLOAT', 'DOUBLE', 'DECIMAL']):
+            # Use APPROX_QUANTILES to avoid scanning huge tables in some cases
+            qry = f"SELECT MIN({col_back}) AS min_val, MAX({col_back}) AS max_val, AVG({col_back}) AS avg_val FROM {table_fq} WHERE {col_back} IS NOT NULL"
+        elif any(t in dtype for t in ['BOOL', 'BOOLEAN']):
+            qry = f"SELECT COUNTIF({col_back}) AS true_count, COUNT(*) - COUNTIF({col_back}) AS false_count, COUNT(*) AS total_count FROM {table_fq}"
+        else:
+            # Fallback: sample distinct values
+            qry = f"SELECT ARRAY_AGG(DISTINCT {col_back} ORDER BY {col_back} LIMIT 10) AS distinct_vals, COUNT(DISTINCT {col_back}) AS distinct_count FROM {table_fq} WHERE {col_back} IS NOT NULL"
+
+        try:
+            df_sum = client.query(qry).to_dataframe()
+            if not df_sum.empty:
+                # Convert numpy types to python native with json-safe conversions later
+                summaries[col] = {k: (v.tolist() if hasattr(v, 'tolist') else v) for k, v in df_sum.iloc[0].to_dict().items()}
+            else:
+                summaries[col] = {}
+        except Exception as e:
+            summaries[col] = {"error": str(e)}
+
+    # Build prompt including summaries to give the model context about column values
     cols_to_describe = schema_df[['column_name', 'data_type']].to_dict('records')
+    # JSON-friendly summaries string
+    try:
+        summaries_str = json.dumps(summaries, default=str)
+    except Exception:
+        summaries_str = str(summaries)
+
     prompt = f"""
-    Given the table name `{project}.{dataset}.{table}`, provide a concise, one-line description for each of the following columns.
-    Return the output as a simple JSON object where keys are the column names and values are the descriptions. Do not include any other text or markdown formatting.
+Given the table name `{project}.{dataset}.{table}`, and the following per-column lightweight data summaries, provide a concise, one-line description for each of the columns.
 
-    Columns:
-    {cols_to_describe}
+Columns metadata:
+{cols_to_describe}
 
-    JSON Output:
-    """
+Column value summaries (samples / stats):
+{summaries_str}
+
+Please return the output as a simple JSON object where keys are the column names and values are the descriptions. Do not include any other text or markdown formatting.
+"""
+
     with st.spinner("🪄 Enhancing column descriptions..."):
         try:
             response = model.generate_content(prompt)
             json_str = response.text.strip().removeprefix("```json").removesuffix("```").strip()
             try:
                 desc_dict = json.loads(json_str)
-                descriptions = pd.Series(desc_dict)
-                schema_df['column_description'] = schema_df['column_name'].map(descriptions).fillna(schema_df['column_description'])
-                st.session_state.bq_schema_df = schema_df
-                st.rerun()
             except json.JSONDecodeError:
-                st.error("AI model returned an invalid JSON format. Please try again.")
-                st.code(json_str, language="json")
+                # If the LLM response isn't strict JSON, fall back to a safe heuristic: create descriptions from summaries
+                desc_dict = {}
+
+            # Build human-readable appendices from the computed summaries
+            def humanize_summary(col_name, summ):
+                if not summ:
+                    return ""
+                if 'error' in summ:
+                    return f" (Could not compute data summary: {summ['error']})"
+                # Strings / categorical
+                if 'distinct_vals' in summ or 'distinct_count' in summ:
+                    vals = summ.get('distinct_vals')
+                    cnt = summ.get('distinct_count')
+                    sample = ', '.join([str(x) for x in (vals or [])]) if vals else ''
+                    if cnt is not None:
+                        if sample:
+                            return f" (Sample distinct values: {sample}; distinct count ≈ {cnt})"
+                        return f" (Distinct count ≈ {cnt})"
+                # Dates
+                if 'min_val' in summ or 'max_val' in summ:
+                    mn = summ.get('min_val')
+                    mx = summ.get('max_val')
+                    return f" (Value range: {mn} → {mx})"
+                # Numeric
+                if 'avg_val' in summ or 'min_val' in summ or 'max_val' in summ:
+                    mn = summ.get('min_val')
+                    mx = summ.get('max_val')
+                    avg = summ.get('avg_val')
+                    pieces = []
+                    if mn is not None and mx is not None:
+                        pieces.append(f"range {mn}–{mx}")
+                    if avg is not None:
+                        try:
+                            pieces.append(f"avg {float(avg):.2f}")
+                        except Exception:
+                            pieces.append(f"avg {avg}")
+                    return f" ({'; '.join(pieces)})" if pieces else ""
+                # Boolean
+                if 'true_count' in summ and 'false_count' in summ:
+                    t = summ.get('true_count', 0)
+                    fct = summ.get('false_count', 0)
+                    tot = summ.get('total_count', t + fct)
+                    return f" (True: {t}, False: {fct}, total: {tot})"
+                return ''
+
+            # If LLM returned JSON, use that, else fall back to a basic autogenerated description
+            final_descriptions = {}
+            for _, row in schema_df.iterrows():
+                col = row['column_name']
+                base = ''
+                if isinstance(desc_dict, dict) and col in desc_dict:
+                    base = str(desc_dict[col]).strip()
+                else:
+                    # Fallback heuristics when no LLM description
+                    dt = (row.get('data_type') or '').upper()
+                    if any(t in dt for t in ['INT','NUMERIC','FLOAT','DOUBLE','DECIMAL']):
+                        base = f"Numeric field."
+                    elif any(t in dt for t in ['DATE','TIMESTAMP','DATETIME']):
+                        base = f"Temporal field."
+                    elif any(t in dt for t in ['BOOL','BOOLEAN']):
+                        base = f"Boolean flag."
+                    else:
+                        base = f"Categorical/text field."
+
+                appendix = humanize_summary(col, summaries.get(col, {}))
+                final_descriptions[col] = (base + appendix).strip()
+
+            # Apply to schema and update session
+            descriptions = pd.Series(final_descriptions)
+            schema_df['column_description'] = schema_df['column_name'].map(descriptions).fillna(schema_df['column_description'])
+            st.session_state.bq_schema_df = schema_df
+            st.rerun()
         except Exception as e:
             st.error(f"AI enhancement failed: {e}")
 
