@@ -233,7 +233,7 @@ def enhance_table_description_llm():
     schema_str = "\n".join([f"- {row.column_name} ({row.data_type})" for _, row in schema_df.iterrows()])
     prompt = f"""
     Based on the fully qualified table name `{project}.{dataset}.{table}` and its schema, please provide a concise, one-sentence description of what this table likely contains.
-
+    Consider this table description if given: {st.session_state.bq_table_desc}
     Schema:
     {schema_str}
 
@@ -300,7 +300,7 @@ def enhance_column_descriptions_llm():
 
     prompt = f"""
 Given the table name `{project}.{dataset}.{table}`, and the following per-column lightweight data summaries, provide a concise, one-line description for each of the columns.
-
+Consider this table description if given: {st.session_state.bq_table_desc}
 Columns metadata:
 {cols_to_describe}
 
