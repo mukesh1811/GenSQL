@@ -1,3 +1,15 @@
+## auth
+# gcloud auth login
+# gcloud auth application-default login
+
+## set project
+# gcloud config set project aeo-supplychain-datamart-prod
+# gcloud auth application-default set-quota-project aeo-supplychain-datamart-prod
+
+## set project
+# gcloud config set project learning-prj-id
+# gcloud auth application-default set-quota-project learning-prj-id
+
 import streamlit as st
 import pandas as pd
 import json
@@ -170,12 +182,161 @@ def run_profiling_query(sql_query: str) -> str:
 
     try:
         df = bq_client.query(sql_query_limited).to_dataframe()
-        # Convert date/timestamp columns for JSON serialization if needed
-        for col in df.select_dtypes(include=['datetime64[ns]', 'dbdate', 'timestamp']).columns:
-            df[col] = df[col].astype(str)
-        return df.to_json(orient='records')
+
+        # Convert datetime-like columns for JSON serialization if needed.
+        # Use only pandas-recognized datetime dtype names and provide a fallback
+        # that checks each column with pandas' type-checking utility.
+        # try:
+        #     datetime_cols = df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, tz]']).columns
+        # except Exception:
+        #     from pandas.api.types import is_datetime64_any_dtype
+        #     datetime_cols = [c for c in df.columns if is_datetime64_any_dtype(df[c])]
+        # for col in datetime_cols:
+        #     df[col] = df[col].astype(str)
+        
+        return df.to_json(orient='records',date_format='iso')
     except Exception as e:
         return json.dumps({"error": f"Query failed for '{sql_query_limited}': {e}"})
+
+
+# -----------------------
+# Column profiling helpers
+# -----------------------
+def _safe_parse_single_record(json_text: str):
+    """Return first record dict or None on error."""
+    try:
+        data = json.loads(json_text)
+        print(data)
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+            return data[0]
+    except Exception:
+        pass
+    return None
+
+
+def _extract_embedded_json(text: str):
+    """Try to extract a JSON object or array embedded in arbitrary text.
+
+    Returns the JSON substring or None if not found.
+    This scans for a balanced '{' ... '}' or '[' ... ']' block.
+    """
+    if not isinstance(text, str):
+        return None
+
+    text = text.strip()
+    # Quick checks: if the whole text is JSON-like already
+    if (text.startswith('{') and text.endswith('}')) or (text.startswith('[') and text.endswith(']')):
+        return text
+
+    # Search for a balanced JSON object
+    for start_char, end_char in ('{', '}'), ('[', ']'):
+        start_idx = text.find(start_char)
+        if start_idx == -1:
+            continue
+        depth = 0
+        for i in range(start_idx, len(text)):
+            ch = text[i]
+            if ch == start_char:
+                depth += 1
+            elif ch == end_char:
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start_idx:i+1]
+                    return candidate
+    return None
+
+
+def profile_column(project_id: str, dataset_id: str, table_id: str, column_name: str, data_type: str) -> str:
+    """Run a small set of profiling queries for a single column and return a concise summary string.
+
+    Uses `run_profiling_query` for all queries and is defensive about errors.
+    """
+    col = column_name
+    table_ref = f"{project_id}.{dataset_id}.{table_id}"
+    summary_parts = []
+
+    try:
+        dt = (data_type or "").upper()
+        print(f"[profiler] Starting profiling for {project_id}.{dataset_id}.{table_id}.{col} (type={dt})")
+
+        # DATE / TIMESTAMP types: get min/max
+        if 'DATE' in dt or 'TIMESTAMP' in dt or 'TIME' in dt:
+            q = f"SELECT MIN(`{col}`) AS min_val, MAX(`{col}`) AS max_val FROM `{table_ref}`"
+            res = run_profiling_query(q)
+            r = _safe_parse_single_record(res)
+            if r:
+                summary_parts.append(f"Range: {r.get('min_val')} -> {r.get('max_val')}")
+
+        # NUMERIC types: min/max/avg/stddev
+        elif any(x in dt for x in ['INT', 'FLOAT', 'NUMERIC', 'DECIMAL']) and col != 'sku':
+            q = f"SELECT MIN(`{col}`) AS min_val, MAX(`{col}`) AS max_val, AVG(`{col}`) AS avg_val, STDDEV_POP(`{col}`) AS stddev FROM `{table_ref}`"
+            res = run_profiling_query(q)
+            r = _safe_parse_single_record(res)
+            if r:
+                summary_parts.append(f"Min: {r.get('min_val')}, Max: {r.get('max_val')}, Avg: {r.get('avg_val')}, Std: {r.get('stddev')}")
+
+        # BOOLEAN
+        elif 'BOOL' in dt or 'BOOLEAN' in dt:
+            q = f"SELECT COUNTIF(`{col}` = TRUE) AS true_count, COUNTIF(`{col}` = FALSE) AS false_count, COUNT(*) AS total_count FROM `{table_ref}`"
+            res = run_profiling_query(q)
+            r = _safe_parse_single_record(res)
+            if r:
+                summary_parts.append(f"True: {r.get('true_count')}, False: {r.get('false_count')}, Total: {r.get('total_count')}")
+
+        # Strings / Text / Others: check distinct count first to detect categorical
+        else:
+            # approximate distinct count
+            q_dist = f"SELECT APPROX_COUNT_DISTINCT(`{col}`) AS distinct_count FROM `{table_ref}`"
+            resd = run_profiling_query(q_dist)
+            rd = _safe_parse_single_record(resd)
+            distinct_count = None
+            try:
+                if rd and 'distinct_count' in rd:
+                    distinct_count = int(rd['distinct_count'])
+            except Exception:
+                distinct_count = None
+
+            if distinct_count is not None and distinct_count <= 10:
+                # Fetch distinct values to show examples
+                q_vals = f"SELECT DISTINCT `{col}` AS val FROM `{table_ref}` ORDER BY val LIMIT 20"
+                resv = run_profiling_query(q_vals)
+                try:
+                    vals = json.loads(resv)
+                    examples = [str(r.get('val')) for r in vals if isinstance(r, dict) and 'val' in r]
+                    summary_parts.append(f"Categorical (~{distinct_count} distinct). Examples: {', '.join(examples[:10])}")
+                except Exception:
+                    summary_parts.append(f"Categorical (~{distinct_count} distinct values)")
+            else:
+                # Provide sample values and average length (for strings)
+                q_sample = f"SELECT `{col}` AS sample_val FROM `{table_ref}` WHERE `{col}` IS NOT NULL LIMIT 10"
+                resample = run_profiling_query(q_sample)
+                try:
+                    sdata = json.loads(resample)
+                    samples = [str(r.get('sample_val')) for r in sdata if isinstance(r, dict) and 'sample_val' in r]
+                    if samples:
+                        summary_parts.append(f"({distinct_count} distinct values). Sample values: {', '.join(samples[:5])}")
+                except Exception:
+                    pass
+
+                # If string-like, try avg length
+                if 'CHAR' in dt or 'STRING' in dt or 'TEXT' in dt:
+                    q_len = f"SELECT AVG(LENGTH(`{col}`)) AS avg_len FROM `{table_ref}` WHERE `{col}` IS NOT NULL"
+                    rlen = run_profiling_query(q_len)
+                    rl = _safe_parse_single_record(rlen)
+                    if rl and rl.get('avg_len') is not None:
+                        summary_parts.append(f"Avg length: {rl.get('avg_len')}")
+
+    except Exception as e:
+        # Non-fatal: return what we have plus an error note
+        summary_parts.append(f"(profiling error: {e})")
+        print(f"[profiler] Error profiling {col}: {e}")
+
+    summary = ' | '.join(summary_parts)
+    if summary:
+        print(f"[profiler] Summary for {col}: {summary}")
+    else:
+        print(f"[profiler] No profiling summary generated for {col}")
+    return summary
 
 # =============================================================================
 # 3. AGENT DEFINITION (The "Brain")
@@ -227,12 +388,12 @@ def get_gemini_model():
 
     # Create the model with function calling capabilities
     model = GenerativeModel(
-        model_name="gemini-2.5-flash",
+        model_name="gemini-2.5-pro",
         generation_config={
             "temperature": 0.1,
             "top_p": 1,
             "top_k": 1,
-            "max_output_tokens": 2048,
+            # "max_output_tokens": 2048,
         }
     )
     
@@ -255,7 +416,7 @@ st.title("Auto-Curator Agent Demo 🤖 (powered by Google ADK)")
 st.caption("This app uses an AI agent to automatically profile a BigQuery table and generate high-quality, 'semantically-aware' descriptions.")
 
 if "table_desc" not in st.session_state: st.session_state.table_desc = ""
-if "column_desc_df" not in st.session_state: st.session_state.column_desc_df = pd.DataFrame(columns=["column_name", "data_type", "description"])
+if "column_desc_df" not in st.session_state: st.session_state.column_desc_df = pd.DataFrame(columns=["column_name", "data_type", "description", "profile_summary"])
 
 st.header("1. Select a Table to Profile")
 st.info("Ensure your Application Default Credentials (`gcloud auth application-default login`) have access to the selected GCP Project.", icon="🔑")
@@ -269,9 +430,13 @@ st.info("Ensure your Application Default Credentials (`gcloud auth application-d
 # DEFAULT_DATASET = "samples"
 # DEFAULT_TABLE = "wikipedia"
 
-DEFAULT_PROJECT = "learning-prj-id"
-DEFAULT_DATASET = "forecasting_sticker_sales"
-DEFAULT_TABLE = "train"
+# DEFAULT_PROJECT = "learning-prj-id"
+# DEFAULT_DATASET = "forecasting_sticker_sales"
+# DEFAULT_TABLE = "train"
+
+DEFAULT_PROJECT = "aeo-supplychain-datamart-prod"
+DEFAULT_DATASET = "runnelsg"
+DEFAULT_TABLE = "ls_with_boss"
 
 col1, col2, col3 = st.columns(3)
 project_id = col1.text_input("GCP Project ID", DEFAULT_PROJECT)
@@ -303,7 +468,7 @@ To accomplish this:
 1. First get the schema using the SQL: SELECT column_name, data_type FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS` WHERE table_name = '{table}'
 2. Look for date/timestamp columns to understand the grain (daily, weekly, monthly)
 3. Use COUNT(DISTINCT date_col) to determine granularity
-4. Create descriptions that reflect the table's purpose and grain
+4. Create descriptions that reflect the table's purpose and grain. Include a single line explaining the available columns in this table and what kind of data is this.
 5. Verify that every column from step 1 has a description before returning
 
 Return ONLY a valid JSON object with:
@@ -352,7 +517,7 @@ if st.button(f"✨ Auto-Profile Table"):
         st.warning("Please provide Project ID, Dataset ID, and Table ID.")
     else:
         st.session_state.table_desc = ""
-        st.session_state.column_desc_df = pd.DataFrame(columns=["column_name", "data_type", "description"])
+        st.session_state.column_desc_df = pd.DataFrame(columns=["column_name", "data_type", "description", "profile_summary"])
 
         user_input_text = f"Please profile this table: {project_id}.{dataset_id}.{table_id}"
 
@@ -361,12 +526,20 @@ if st.button(f"✨ Auto-Profile Table"):
 
             if final_output_text:
                 try:
-                    # Clean up markdown backticks and ensure it's just the JSON
-                    clean_json_text = final_output_text.strip()
-                    if clean_json_text.startswith("```json"):
-                        clean_json_text = clean_json_text[7:-4].strip()
-                    elif clean_json_text.startswith("```"):
+                    # Clean up markdown backticks and try to robustly extract embedded JSON
+                    raw_text = final_output_text or ""
+                    clean_json_text = raw_text.strip()
+
+                    # If wrapped in triple-backticks with json, unwrap those first
+                    if clean_json_text.startswith("```json") and clean_json_text.endswith("```"):
+                        clean_json_text = clean_json_text[7:-3].strip()
+                    elif clean_json_text.startswith("```") and clean_json_text.endswith("```"):
                         clean_json_text = clean_json_text[3:-3].strip()
+
+                    # Attempt to extract a JSON object/array embedded anywhere in the text
+                    extracted = _extract_embedded_json(clean_json_text)
+                    if extracted:
+                        clean_json_text = extracted
 
                     final_answer_json = json.loads(clean_json_text)
 
@@ -400,7 +573,7 @@ if st.button(f"✨ Auto-Profile Table"):
                     if schema_error:
                         st.warning(f"Could not fetch or parse base schema: {schema_error}")
                         # Still try to show table description if agent provided one
-                        st.session_state.column_desc_df = pd.DataFrame() # Ensure empty dataframe
+                        st.session_state.column_desc_df = pd.DataFrame(columns=["column_name", "data_type", "description", "profile_summary"]) # Ensure empty dataframe with expected columns
 
                     col_desc_dict = final_answer_json.get("column_descriptions", {})
                     if not isinstance(col_desc_dict, dict):
@@ -466,6 +639,17 @@ Return a JSON object with ONLY the missing column descriptions in this format:
                                     # Keep track of truly missing descriptions after retry
                                     if col_name in missing_cols_from_agent:
                                         st.warning(f"Failed to generate description for column: {col_name}")
+                                # Run lightweight profiling to enrich the description
+                                try:
+                                    prof = profile_column(project_id, dataset_id, table_id, col_name, row.get('data_type'))
+                                    print(f"[profiler] Called profile_column for {col_name}, got: {prof}")
+                                    # Store profiling summary in its own column so UI can render it reliably
+                                    row['profile_summary'] = prof or ''
+                                except Exception as e:
+                                    # Don't fail the whole flow for profiling errors
+                                    print(f"Warning: profiling failed for {col_name}: {e}")
+                                    row['profile_summary'] = f"(profiling error: {e})"
+
                                 processed_rows.append(row)
                             else:
                                 st.warning(f"Skipping invalid row in fetched schema: {row}")
