@@ -127,12 +127,18 @@ st.set_page_config(
 def _init_state():
     """Initializes all required session state variables."""
     ss = st.session_state
-    ss.setdefault("view", "analysis")
+    # --- MODIFIED: Added 'view_context' to page views ---
+    ss.setdefault("view", "analysis") # analysis, context, view_context
     ss.setdefault("auth", False)
     ss.setdefault("ctx_set", False)
     ss.setdefault("selected_tables", [])
     ss.setdefault("schema_df", pd.DataFrame())
-    ss.setdefault("pick", {"project": None, "dataset": None, "table": None})
+    
+    # --- NEW: State for BQ pickers ---
+    ss.setdefault("pick_project", None)
+    ss.setdefault("pick_dataset", None)
+    ss.setdefault("pick_table", None)
+    
     # State for "Upload Schema" tab
     ss.setdefault("smpl_tbl_desc", "")
     ss.setdefault("upload_schema_df", pd.DataFrame())
@@ -142,6 +148,7 @@ def _init_state():
     # State for chat messages and flow control
     ss.setdefault("messages", [])
     ss.setdefault("current_plan_approved", False)
+    ss.setdefault("context_source", None) # 'upload' or 'bq'
 
 _init_state()
 
@@ -155,7 +162,7 @@ def set_ctx_if_ready():
         not st.session_state.schema_df.empty
     )
 
-def set_context(project: str, dataset: str, table: str, description: str, schema_df: pd.DataFrame):
+def set_context(project: str, dataset: str, table: str, description: str, schema_df: pd.DataFrame, source: str):
     """Overwrites the main context with new table information."""
     if not all([project, dataset, table]) or schema_df.empty:
         st.error("Cannot set context with incomplete information.")
@@ -164,6 +171,7 @@ def set_context(project: str, dataset: str, table: str, description: str, schema
         {"project": project, "dataset": dataset, "table": table, "description": description}
     ]
     st.session_state.schema_df = schema_df
+    st.session_state.context_source = source # <--- NEW
     set_ctx_if_ready()
     st.toast(f"Context set to `{project}.{dataset}.{table}`", icon="🧠")
 
@@ -172,6 +180,7 @@ def clear_context():
     st.session_state.selected_tables = []
     st.session_state.schema_df = pd.DataFrame()
     st.session_state.ctx_set = False
+    st.session_state.context_source = None # <--- NEW
     st.session_state.messages = []
     st.toast("Context cleared.", icon="🗑️")
     st.rerun()
@@ -179,11 +188,12 @@ def clear_context():
 def add_bq_table_to_context():
     """Sets the selected BQ table as the main context."""
     set_context(
-        project=st.session_state.pick["project"],
-        dataset=st.session_state.pick["dataset"],
-        table=st.session_state.pick["table"],
+        project=st.session_state.pick_project, # <-- MODIFIED
+        dataset=st.session_state.pick_dataset, # <-- MODIFIED
+        table=st.session_state.pick_table, # <-- MODIFIED
         description=st.session_state.bq_table_desc,
-        schema_df=st.session_state.bq_schema_df
+        schema_df=st.session_state.bq_schema_df,
+        source="bq" # <--- NEW
     )
     st.session_state.bq_schema_df = pd.DataFrame()
     st.session_state.bq_table_desc = ""
@@ -191,13 +201,16 @@ def add_bq_table_to_context():
 
 def on_project_change():
     """Resets selections when the GCP project changes."""
-    st.session_state.pick.update({"dataset": None, "table": None})
+    # This callback clears downstream pickers and the schema dataframe
+    st.session_state.pick_dataset = None # <-- MODIFIED
+    st.session_state.pick_table = None # <-- MODIFIED
     st.session_state.bq_schema_df = pd.DataFrame()
     st.session_state.bq_table_desc = ""
 
 def on_dataset_change():
     """Resets selections when the dataset changes."""
-    st.session_state.pick.update({"table": None})
+    # This callback clears the table picker and the schema dataframe
+    st.session_state.pick_table = None # <-- MODIFIED
     st.session_state.bq_schema_df = pd.DataFrame()
     st.session_state.bq_table_desc = ""
 
@@ -212,6 +225,8 @@ def enh_smpl_tbl_desc(tbl):
 def load_sample_schema():
     """Callback to load the sample Citibike schema and reset description."""
     try:
+        # --- NOTE: Assuming 'data/sample_schema.csv' exists ---
+        # --- This will fail if the file is not present ---
         st.session_state.upload_schema_df = pd.read_csv("data/sample_schema.csv", dtype=str)
         # Reset the description in the callback to avoid widget state errors
         st.session_state.smpl_tbl_desc = ""
@@ -223,7 +238,9 @@ def load_sample_schema():
 def enhance_table_description_llm():
     """Uses the LLM to generate a table description based on its name and schema."""
     model = get_model()
-    project, dataset, table = st.session_state.pick.values()
+    project = st.session_state.pick_project # <-- MODIFIED
+    dataset = st.session_state.pick_dataset # <-- MODIFIED
+    table = st.session_state.pick_table # <-- MODIFIED
     schema_df = st.session_state.bq_schema_df
 
     if not all([project, dataset, table]) or schema_df.empty:
@@ -249,7 +266,9 @@ def enhance_table_description_llm():
 def enhance_column_descriptions_llm():
     """Uses the LLM to generate descriptions for all columns in a table."""
     model = get_model()
-    project, dataset, table = st.session_state.pick.values()
+    project = st.session_state.pick_project # <-- MODIFIED
+    dataset = st.session_state.pick_dataset # <-- MODIFIED
+    table = st.session_state.pick_table # <-- MODIFIED
     schema_df = st.session_state.bq_schema_df.copy()
 
     if not all([project, dataset, table]) or schema_df.empty:
@@ -635,6 +654,30 @@ def render_ctx_page():
     st.header("Set Context")
     st.caption("Set your context by uploading a schema file or picking a BigQuery table.")
 
+    # --- MODIFIED: Pre-populate edit view if changing context ---
+    # On page load, if context is set and upload schema is empty, populate them
+    # This makes "Change Context" show the editable view
+    if (st.session_state.ctx_set and 
+        st.session_state.selected_tables and
+        st.session_state.upload_schema_df.empty):  # Only check upload schema
+         table_info = st.session_state.selected_tables[0]
+         current_schema_df = st.session_state.schema_df.copy()
+         current_description = table_info.get('description', '')
+         context_source = st.session_state.get('context_source')
+ 
+         if context_source == "upload":
+             st.session_state.upload_schema_df = current_schema_df
+             st.session_state.smpl_tbl_desc = current_description
+             
+         elif context_source == "bq":
+             st.session_state.bq_schema_df = current_schema_df
+             st.session_state.bq_table_desc = current_description
+             st.session_state.pick_project = table_info['project']
+             st.session_state.pick_dataset = table_info['dataset']
+             st.session_state.pick_table = table_info['table']
+             st.session_state.auth = True
+    # --- END MODIFIED LOGIC ---
+
     tab_upl, tab_pick = st.tabs(["Upload Schema", "Pick a BigQuery table"])
 
     with tab_upl:
@@ -685,10 +728,10 @@ def render_ctx_page():
             c1, c2 = st.columns([9, 2])
             c1.text_area("Table Description", key="smpl_tbl_desc", placeholder="Add custom description for this table", label_visibility="collapsed")
             c2.button("Enhance", 
-                      icon="🪄", help="A.I. will populate the table description for you", 
-                      on_click=enh_smpl_tbl_desc,
-                      key="enhance_upload_tbl_desc",
-                      args=[tbl])
+                        icon="🪄", help="A.I. will populate the table description for you", 
+                        on_click=enh_smpl_tbl_desc,
+                        key="enhance_upload_tbl_desc",
+                        args=[tbl])
 
             st.divider()
             st.caption("**Table Schema**")
@@ -702,10 +745,14 @@ def render_ctx_page():
 
             c3, c4 = st.columns(2)
             if c3.button("Enhance Schema", icon="🪄", help="A.I. will populate the column description for you", key="enhance_upload_schema"):
-                st.session_state.upload_schema_df = pd.read_csv("data/sample_schema_with_desc.csv")
+                # --- NOTE: This assumes 'data/sample_schema_with_desc.csv' exists ---
+                try:
+                    st.session_state.upload_schema_df = pd.read_csv("data/sample_schema_with_desc.csv")
+                except FileNotFoundError:
+                    st.error("`data/sample_schema_with_desc.csv` not found. Cannot enhance sample.")
                 st.rerun()
             if c4.button("Set as Context", icon="🧠", key="set_context_upload_btn"):
-                set_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema)
+                set_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema, source="upload") # <--- MODIFIED
                 st.session_state.upload_schema_df = pd.DataFrame()
                 # st.session_state.smpl_tbl_desc = ""
                 st.rerun()
@@ -732,32 +779,32 @@ def render_ctx_page():
                 st.error(f"Error listing projects: {e}")
                 projects = []
 
+            # --- MODIFIED: Use key to manage state, no redundant assignment ---
             project = st.selectbox("GCP Project", [""] + projects, placeholder="Select a project", key="pick_project", on_change=on_project_change)
-            st.session_state.pick["project"] = project or None
 
-            datasets = list_datasets(project) if project else []
+            project_val = st.session_state.pick_project
+            datasets = list_datasets(project_val) if project_val else []
             dataset = st.selectbox("Dataset", [""] + datasets, placeholder="Select a dataset", key="pick_dataset", on_change=on_dataset_change)
-            st.session_state.pick["dataset"] = dataset or None
 
-            tables = list_tables(project, dataset) if project and dataset else []
+            dataset_val = st.session_state.pick_dataset
+            tables = list_tables(project_val, dataset_val) if project_val and dataset_val else []
             table = st.selectbox("Table", [""] + tables, placeholder="Select a table", key="pick_table")
-            st.session_state.pick["table"] = table or None
 
-            if all(st.session_state.pick.values()):
-                if st.session_state.bq_schema_df.empty or st.session_state.bq_schema_df['table_name'].iloc[0] != table:
-                    st.session_state.bq_schema_df = get_table_schema(project, dataset, table)
+            table_val = st.session_state.pick_table
+            
+            if all([project_val, dataset_val, table_val]): # <-- MODIFIED
+                # This block now only runs if the schema is empty or the table changed
+                if st.session_state.bq_schema_df.empty or st.session_state.bq_schema_df['table_name'].iloc[0] != table_val: # <-- MODIFIED
+                    st.session_state.bq_schema_df = get_table_schema(project_val, dataset_val, table_val) # <-- MODIFIED
                     st.session_state.bq_table_desc = ""
-                    # st.rerun()
-
-                st.divider()
-                st.subheader("3. Preview & Enhance Context")
+                    # st.rerun() # Rerun can cause issues here
                 c1, c2 = st.columns([9, 2])
                 c1.text_area("Table Description", key="bq_table_desc", placeholder="Add custom description for this table", label_visibility="collapsed")
                 c2.button("Enhance", icon="🪄", 
-                          help="A.I. will populate table description", 
-                          on_click=enhance_table_description_llm, 
-                          key="enhance_bq_tbl_desc"
-                          )
+                            help="A.I. will populate table description", 
+                            on_click=enhance_table_description_llm, 
+                            key="enhance_bq_tbl_desc"
+                            )
 
                 if not st.session_state.bq_schema_df.empty:
                     st.divider()
@@ -789,6 +836,62 @@ def render_ctx_page():
     if st.button("Return", icon="⬅️", use_container_width=True):
         st.session_state.view = "analysis"
         st.rerun()
+
+
+# =========================
+# --- NEW: View Context Page UI ---
+# =========================
+def render_view_context_page():
+    """Displays the currently set context (table and schema)."""
+    st.header("View Current Context")
+
+    if not st.session_state.ctx_set or not st.session_state.selected_tables:
+        st.error("No context is currently set.")
+        if st.button("Set Context", icon="🧠", use_container_width=True):
+            st.session_state.view = "context"
+            st.rerun()
+        return
+
+    # Display current context
+    table_info = st.session_state.selected_tables[0]
+    schema_df = st.session_state.schema_df
+
+    st.subheader("Table Information")
+    st.markdown(f"**Name:** `{table_info['project']}.{table_info['dataset']}.{table_info['table']}`")
+    
+    st.markdown("**Description:**")
+    if table_info.get('description'):
+        st.info(table_info['description'])
+    else:
+        st.caption("No description provided for this table.")
+
+    st.divider()
+
+    st.subheader("Table Schema")
+    if schema_df.empty:
+        st.warning("Schema data is missing from the current context.")
+    else:
+        # Use st.dataframe for a read-only view
+        st.dataframe(
+            schema_df, 
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "column_description": st.column_config.TextColumn("Column Description")
+            }
+        )
+    
+    st.divider()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Return to Analysis", icon="⬅️", use_container_width=True):
+            st.session_state.view = "analysis"
+            st.rerun()
+    with c2:
+        if st.button("Change Context", icon="🔄", use_container_width=True):
+            st.session_state.view = "context"
+            st.rerun()
 
 
 # =========================
@@ -866,7 +969,12 @@ def render_default_page():
                         # Verify columns exist before trying to chart
                         if chart_info["x_axis"] in chart_df.columns and chart_info["y_axis"] in chart_df.columns:
                             # Streamlit charts often work best with the x-axis set as the index
-                            chart_df_indexed = chart_df.set_index(chart_info["x_axis"])
+                            try:
+                                chart_df_indexed = chart_df.set_index(chart_info["x_axis"])
+                            except Exception:
+                                # Fallback if index can't be set (e.g., non-unique values)
+                                chart_df_indexed = chart_df
+                                
                             chart_type = chart_info["chart_type"]
                             
                             st.write(f"**{chart_info.get('title', 'Generated Chart')}**")
@@ -991,7 +1099,7 @@ def render_default_page():
 
 
 # =========================
-# Sidebar UI
+# --- MODIFIED: Sidebar UI ---
 # =========================
 st.sidebar.title("F.R.I.D.A.Y")
 st.sidebar.caption("AI-Powered Analytics Assistant")
@@ -999,6 +1107,9 @@ st.sidebar.caption("AI-Powered Analytics Assistant")
 st.sidebar.title("Context")
 if not st.session_state.ctx_set:
     st.sidebar.warning("Context is empty", icon="⚠️")
+    if st.sidebar.button("Set Context", icon="🧠", use_container_width=True):
+        st.session_state.view = "context"
+        st.rerun()
 else:
     st.sidebar.success("Context set", icon="✅")
     if st.session_state.selected_tables:
@@ -1009,9 +1120,13 @@ else:
     if not st.session_state.schema_df.empty:
         st.sidebar.caption("Schema: loaded")
 
-if st.sidebar.button("Set/Change Context", icon="🧠", use_container_width=True):
-    st.session_state.view = "context"
-    st.rerun()
+    if st.sidebar.button("View Context Details", icon="📄", use_container_width=True):
+        st.session_state.view = "view_context"
+        st.rerun()
+    
+    if st.sidebar.button("Change Context", icon="🔄", use_container_width=True):
+        st.session_state.view = "context"
+        st.rerun()
 
 with st.sidebar.expander("ℹ️ How it works", expanded=True):
     st.markdown("""
@@ -1025,9 +1140,13 @@ with st.sidebar.expander("ℹ️ How it works", expanded=True):
 """)
 
 # =========================
-# Main Router
+# --- MODIFIED: Main Router ---
 # =========================
 if st.session_state.view == "context":
     render_ctx_page()
+elif st.session_state.view == "view_context":
+    render_view_context_page()
 else:
+    # Default to analysis view
+    st.session_state.view = "analysis"
     render_default_page()
