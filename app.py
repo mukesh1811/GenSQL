@@ -23,6 +23,205 @@ import google.auth
 # Gemini / Vertex AI Imports
 import vertexai
 from vertexai.generative_models import GenerativeModel
+from vertexai.language_models import TextEmbeddingModel
+import chromadb
+from chromadb.config import Settings
+import os
+import numpy as np
+from pathlib import Path
+
+
+VERTEX_LOCATION = "us-central1"  # fixed region; no env vars
+
+def _safe_vertex_init():
+    """Idempotent Vertex init using the same project as your BQ client."""
+    project_id = _get_active_gcp_project()
+    try:
+        vertexai.init(project=project_id, location=VERTEX_LOCATION)
+    except Exception as e:
+        raise RuntimeError(
+            f"Vertex init failed for project '{project_id}' in '{VERTEX_LOCATION}': {e}"
+        )
+
+def _get_active_gcp_project() -> str:
+    """
+    Returns the GCP project ID using the same ADC path you use for BigQuery:
+    1) Prefer bigquery.Client().project (matches your schema/table access)
+    2) Fallback to google.auth.default()
+    """
+    try:
+        return bigquery.Client().project
+    except Exception:
+        _, project_id = google.auth.default()
+        if not project_id:
+            raise RuntimeError("Could not determine active GCP project from ADC.")
+        return project_id
+
+
+@st.cache_resource(show_spinner="Initializing ChromaDB...")
+def get_chroma_client():
+    """Initialize and return a ChromaDB client with local persistence."""
+    try:
+        base_dir = Path(__file__).resolve().parent
+    except Exception:
+        base_dir = Path.cwd()
+    persist_dir = base_dir / "chroma_db"
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    return chromadb.PersistentClient(path=str(persist_dir),settings=
+        Settings(persist_directory=str(persist_dir), anonymized_telemetry=False)
+    )
+
+
+@st.cache_resource
+def get_context_collection():
+    """Get or create the collection for storing context."""
+    client = get_chroma_client()
+    return client.get_or_create_collection(name="schema_context")
+
+
+def get_embedding(text: str) -> list:
+    """Get embedding vector for a given text using Vertex AI."""
+    model = get_embedding_model()
+    embeddings = model.get_embeddings([text])
+    return embeddings[0].values
+
+
+def save_context(table_id: str, column_name: str, description: str, project: str | None = None, dataset: str | None = None):
+    """Save or update context in ChromaDB with embeddings.
+
+    Accepts optional `project` and `dataset` to store fully qualified metadata.
+    
+    NOTE: This function no longer calls client.persist() itself.
+    The calling function (e.g., persist_schema_to_chroma) is responsible
+    for persisting changes in batch.
+    """
+    collection = get_context_collection()
+    # Create a unique ID for the context
+    context_id = f"{table_id}_{column_name}"
+    
+    # Generate embedding for the description
+    embedding = get_embedding(description)
+    
+    # Prepare the combined text for document (for better semantic search)
+    combined_text = f"Table: {table_id}\nColumn: {column_name}\nDescription: {description}"
+
+    # Build metadata dict with optional project/dataset
+    metadata = {
+        "table_id": table_id,
+        "column_name": column_name,
+        "description": description
+    }
+    if project:
+        metadata["project"] = project
+    if dataset:
+        metadata["dataset"] = dataset
+
+    # Check if context already exists
+    existing = collection.get(
+        ids=[context_id],
+        include=['metadatas', 'documents', 'embeddings']
+    )
+
+    if existing['ids']:
+        # Update existing context
+        collection.update(
+            ids=[context_id],
+            documents=[combined_text],
+            embeddings=[embedding],
+            metadatas=[metadata]
+        )
+    else:
+        # Add new context
+        collection.add(
+            ids=[context_id],
+            documents=[combined_text],
+            embeddings=[embedding],
+            metadatas=[metadata]
+        )
+    # --- REMOVED client.persist() ---
+    # We will call persist() once at the end of the batch operation.
+
+
+def persist_schema_to_chroma(project: str, dataset: str, table: str, schema_df: pd.DataFrame, table_description: str | None = None):
+    """Persist a full schema (table + columns) into ChromaDB.
+
+    For each column in `schema_df` this will call `save_context` to add/update
+    the column-level context. The function keeps using `table` as the
+    `table_id` for compatibility with the existing loading logic.
+    """
+    # Keep backward compatibility with existing code that uses bare table name
+    table_id = table
+    for _, row in schema_df.iterrows():
+        col = row.get('column_name')
+        # Prefer explicitly provided column description, falling back to table-level
+        desc = row.get('column_description') if row.get('column_description') is not None else ''
+        final_desc = str(desc) if str(desc).strip() else (table_description or '')
+        if not col:
+            continue
+        try:
+            save_context(table_id=table_id, column_name=col, description=final_desc, project=project, dataset=dataset)
+        except Exception as e:
+            # Don't raise—log and continue to avoid breaking the UI flow
+            st.warning(f"Failed to save context for {table_id}.{col}: {e}")
+            
+    # --- ADDED: Persist once after all columns are saved ---
+    # try:
+    #     client = get_chroma_client()
+    #     client.persist()
+    # except Exception as e:
+    #     st.warning(f"Failed to persist ChromaDB changes to disk: {e}")
+
+
+def get_context(table_id: str = None, column_name: str = None):
+    """Retrieve context from ChromaDB.
+    If table_id is None, returns all contexts.
+    If column_name is None, returns all contexts for the given table.
+    """
+    collection = get_context_collection()
+    
+    if table_id is None:
+        # Get all contexts
+        return collection.get(include=['metadatas', 'documents', 'embeddings'])
+    
+    if column_name is None:
+        # Get all contexts for a specific table
+        return collection.get(
+            where={"table_id": table_id},
+            include=['metadatas', 'documents', 'embeddings']
+        )
+    
+    # Get specific context
+    context_id = f"{table_id}_{column_name}"
+    return collection.get(
+        ids=[context_id],
+        include=['metadatas', 'documents', 'embeddings']
+    )
+
+
+def search_similar_contexts(query: str, n_results: int = 5):
+    """Search for similar contexts using semantic similarity."""
+    collection = get_context_collection()
+    query_embedding = get_embedding(query)
+    
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=n_results,
+        include=['metadatas', 'documents', 'distances']
+    )
+    
+    return results
+
+
+def delete_context(table_id: str, column_name: str):
+    """Delete a specific context from ChromaDB."""
+    client = get_chroma_client()
+    collection = client.get_or_create_collection(name="schema_context")
+    context_id = f"{table_id}_{column_name}"
+    collection.delete(ids=[context_id])
+    # try:
+    #     client.persist()
+    # except Exception as e:
+    #     st.warning(f"Failed to persist ChromaDB deletion: {e}")
 
 
 @st.cache_resource(show_spinner=True)
@@ -32,19 +231,39 @@ def get_bq_client():
     return bigquery.Client()
 
 
+# --- REPLACE your get_model() ---
 @st.cache_resource(show_spinner="Initializing AI...")
 def get_model():
     """Initializes Vertex AI and returns a Gemini model instance."""
+    _safe_vertex_init()
     try:
-        # Get project ID from Application Default Credentials
-        _, project_id = google.auth.default()
-        vertexai.init(project=project_id)
-    except (google.auth.exceptions.DefaultCredentialsError, AttributeError):
-        st.warning("Could not determine GCP project from credentials. Some AI features may not work.")
-        # Fallback initialization
-        vertexai.init()
-    # Use the stable model identifier for the latest version
-    return GenerativeModel("gemini-2.5-flash")
+        from vertexai.generative_models import GenerativeModel
+        return GenerativeModel("gemini-2.5-flash")
+    except Exception:
+        # Fallback for older client versions
+        from vertexai.generative_models import GenerativeModel
+        return GenerativeModel("gemini-1.5-flash")
+
+
+# --- REPLACE your get_embedding_model() ---
+@st.cache_resource(show_spinner="Initializing Embedding Model...")
+def get_embedding_model():
+    """Initializes and returns a Text Embedding model instance."""
+    _safe_vertex_init()
+    from vertexai.language_models import TextEmbeddingModel
+    candidates = ["gemini-embedding-001","text-embedding-005"]
+    last_err = None
+    for mid in candidates:
+        try:
+            m = TextEmbeddingModel.from_pretrained(mid)
+            _ = m.get_embeddings(["warmup"])  # fail fast for scopes/API
+            return m
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(
+        f"Failed to initialize an embedding model ({', '.join(candidates)}). Last error: {last_err}"
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -89,6 +308,18 @@ def get_table_schema(project_id: str, dataset_id: str, table_id: str) -> pd.Data
         default_desc = "<IMP: Add a brief description>"
         df["column_description"] = default_desc
         df["column_description"] = df["column_description"].astype("string")
+        
+        # Load descriptions from ChromaDB
+        stored_context = get_context(table_id)
+        if stored_context['ids']:
+            for idx, metadata in enumerate(stored_context['metadatas']):
+                column_name = metadata['column_name']
+                mask = df['column_name'] == column_name
+                if any(mask):
+                    # --- MODIFIED: Load from metadata 'description' not 'document' ---
+                    # The 'document' has extra text. The 'description' is the raw value.
+                    df.loc[mask, 'column_description'] = metadata.get('description', default_desc)
+        
         return df
     except Exception as e:
         st.error(f"Failed to fetch schema: {e}")
@@ -153,6 +384,128 @@ def _init_state():
 _init_state()
 
 
+# ====================================================================
+# --- NEW: CHROMA-BASED PERSISTENCE FUNCTIONS FOR APP STATE ---
+# ====================================================================
+
+def persist_current_context_marker(project: str, dataset: str, table: str, description: str | None = None):
+    """Persist a small marker in ChromaDB indicating the currently selected context.
+
+    This lets the app reload the last-used context across browser refreshes.
+    """
+    try:
+        client = get_chroma_client()
+        coll = client.get_or_create_collection(name="app_state")
+        ctx_id = "current_context"
+        metadata = {
+            "project": project, 
+            "dataset": dataset, 
+            "table": table, 
+            "description": description or ""
+        }
+        doc = f"Current context: {project}.{dataset}.{table}"
+
+        existing = coll.get(ids=[ctx_id], include=['metadatas', 'documents'])
+        if existing['ids']:
+            coll.update(ids=[ctx_id], documents=[doc], metadatas=[metadata])
+        else:
+            coll.add(ids=[ctx_id], documents=[doc], metadatas=[metadata])
+        
+        # Ensure files are flushed to disk
+    #     client.persist()
+    except Exception as e:
+        st.warning(f"Could not persist app state to ChromaDB: {e}")
+
+
+def load_persisted_context_to_session():
+    """Load persisted context from ChromaDB (if any) into `st.session_state`.
+
+    Attempts to fetch the app-level marker and then reconstruct the full schema
+    either from BigQuery (preferred) or from Chroma-stored column contexts.
+    
+    This should only run ONCE at the start of the app.
+    """
+    # Only run if context is NOT already set (e.g., by user action in this session)
+    if st.session_state.ctx_set:
+        return
+
+    try:
+        client = get_chroma_client()
+        coll = client.get_or_create_collection(name="app_state")
+        existing = coll.get(ids=["current_context"], include=['metadatas', 'documents'])
+        
+        if not existing['ids']:
+            return # No persisted state found
+            
+        meta = existing['metadatas'][0]
+        project = meta.get('project')
+        dataset = meta.get('dataset')
+        table = meta.get('table')
+        description = meta.get('description', '')
+
+        if not all([project, dataset, table]):
+            return # Invalid state saved
+
+        # Try to fetch the full schema from BigQuery (this will also load descriptions from Chroma)
+        try:
+            schema = get_table_schema(project, dataset, table)
+            if not schema.empty:
+                st.session_state.selected_tables = [{"project": project, "dataset": dataset, "table": table, "description": description}]
+                st.session_state.schema_df = schema
+                st.session_state.context_source = 'bq' # Assume it came from BQ
+                set_ctx_if_ready()
+                # restore pickers
+                st.session_state.pick_project = project
+                st.session_state.pick_dataset = dataset
+                st.session_state.pick_table = table
+                st.session_state.auth = True # We must be auth'd if this worked
+                print("Loaded context from BQ via persisted marker.")
+                return
+        except Exception:
+            # Ignore and fallback to rebuilding from Chroma
+            print("BQ fetch failed, falling back to Chroma-only context.")
+            pass
+
+        # Fallback: reconstruct minimal schema from Chroma-stored column contexts
+        contexts = get_context(table)
+        if contexts['ids']:
+            cols = []
+            for idx, md in enumerate(contexts.get('metadatas', [])):
+                col_name = md.get('column_name')
+                desc = md.get('description', '') # Get raw description
+                cols.append({
+                    'table_catalog': project or '',
+                    'table_schema': dataset or '',
+                    'table_name': table,
+                    'column_name': col_name,
+                    'data_type': 'UNKNOWN', # BQ info was lost
+                    'column_description': desc
+                })
+            
+            if cols:
+                schema_df = pd.DataFrame(cols)
+                st.session_state.selected_tables = [{"project": project, "dataset": dataset, "table": table, "description": description}]
+                st.session_state.schema_df = schema_df
+                st.session_state.context_source = 'chroma_fallback'
+                set_ctx_if_ready()
+                st.session_state.pick_project = project
+                st.session_state.pick_dataset = dataset
+                st.session_state.pick_table = table
+                st.session_state.auth = True # Assume auth, but BQ might fail
+                print("Loaded context from Chroma fallback.")
+                
+    except Exception as e:
+        # Best-effort loader; do not raise to avoid breaking UI
+        st.warning(f"Could not load persisted context: {e}")
+        return
+
+# --- LOAD PERSISTED CONTEXT ON SCRIPT RUN ---
+# This runs *after* _init_state() and *before* any UI logic
+load_persisted_context_to_session()
+
+# ====================================================================
+
+
 # =========================
 # Helper Functions
 # =========================
@@ -171,8 +524,19 @@ def set_context(project: str, dataset: str, table: str, description: str, schema
         {"project": project, "dataset": dataset, "table": table, "description": description}
     ]
     st.session_state.schema_df = schema_df
-    st.session_state.context_source = source # <--- NEW
+    st.session_state.context_source = source 
     set_ctx_if_ready()
+    
+    # Persist the schema & descriptions to ChromaDB so context survives sessions
+    try:
+        persist_schema_to_chroma(project, dataset, table, schema_df, description)
+        
+        # --- MODIFIED: Also persist this as the *current* context ---
+        persist_current_context_marker(project, dataset, table, description)
+        
+    except Exception as e:
+        st.warning(f"Failed to persist schema to ChromaDB: {e}")
+
     st.toast(f"Context set to `{project}.{dataset}.{table}`", icon="🧠")
 
 def clear_context():
@@ -180,37 +544,48 @@ def clear_context():
     st.session_state.selected_tables = []
     st.session_state.schema_df = pd.DataFrame()
     st.session_state.ctx_set = False
-    st.session_state.context_source = None # <--- NEW
+    st.session_state.context_source = None 
     st.session_state.messages = []
+    
+    # --- MODIFIED: Clear the persisted marker ---
+    try:
+        client = get_chroma_client()
+        coll = client.get_or_create_collection(name="app_state")
+        coll.delete(ids=["current_context"])
+        # client.persist()
+    except Exception as e:
+        st.warning(f"Could not clear persisted app state: {e}")
+        
     st.toast("Context cleared.", icon="🗑️")
     st.rerun()
 
 def add_bq_table_to_context():
     """Sets the selected BQ table as the main context."""
     set_context(
-        project=st.session_state.pick_project, # <-- MODIFIED
-        dataset=st.session_state.pick_dataset, # <-- MODIFIED
-        table=st.session_state.pick_table, # <-- MODIFIED
+        project=st.session_state.pick_project, 
+        dataset=st.session_state.pick_dataset, 
+        table=st.session_state.pick_table, 
         description=st.session_state.bq_table_desc,
         schema_df=st.session_state.bq_schema_df,
-        source="bq" # <--- NEW
+        source="bq" 
     )
-    st.session_state.bq_schema_df = pd.DataFrame()
-    st.session_state.bq_table_desc = ""
+    # Don't clear bq_schema_df, it's needed for the editor view
+    # st.session_state.bq_schema_df = pd.DataFrame()
+    # st.session_state.bq_table_desc = ""
     st.rerun()
 
 def on_project_change():
     """Resets selections when the GCP project changes."""
     # This callback clears downstream pickers and the schema dataframe
-    st.session_state.pick_dataset = None # <-- MODIFIED
-    st.session_state.pick_table = None # <-- MODIFIED
+    st.session_state.pick_dataset = None 
+    st.session_state.pick_table = None 
     st.session_state.bq_schema_df = pd.DataFrame()
     st.session_state.bq_table_desc = ""
 
 def on_dataset_change():
     """Resets selections when the dataset changes."""
     # This callback clears the table picker and the schema dataframe
-    st.session_state.pick_table = None # <-- MODIFIED
+    st.session_state.pick_table = None 
     st.session_state.bq_schema_df = pd.DataFrame()
     st.session_state.bq_table_desc = ""
 
@@ -227,20 +602,38 @@ def load_sample_schema():
     try:
         # --- NOTE: Assuming 'data/sample_schema.csv' exists ---
         # --- This will fail if the file is not present ---
-        st.session_state.upload_schema_df = pd.read_csv("data/sample_schema.csv", dtype=str)
+        # --- Let's create a fallback DataFrame if file not found ---
+        
+        sample_data = {
+            'table_catalog': ['bigquery-public-data', 'bigquery-public-data'],
+            'table_schema': ['new_york_citibike', 'new_york_citibike'],
+            'table_name': ['citibike_trips', 'citibike_trips'],
+            'column_name': ['tripduration', 'starttime'],
+            'data_type': ['INTEGER', 'TIMESTAMP'],
+            'column_description': ['<IMP: Add a brief description>', '<IMP: Add a brief description>']
+        }
+        
+        try:
+            # Try to load from file first
+            sample_df = pd.read_csv("data/sample_schema.csv", dtype=str)
+        except FileNotFoundError:
+            st.warning("`data/sample_schema.csv` not found. Using a minimal sample.")
+            sample_df = pd.DataFrame(sample_data)
+        
+        st.session_state.upload_schema_df = sample_df
         # Reset the description in the callback to avoid widget state errors
         st.session_state.smpl_tbl_desc = ""
-    except FileNotFoundError:
-        st.error("`data/sample_schema.csv` not found. Please create this file for the sample to work.")
+    except Exception as e:
+        st.error(f"Failed to load sample schema: {e}")
         st.session_state.upload_schema_df = pd.DataFrame()
 
 # --- Gemini Helper Functions ---
 def enhance_table_description_llm():
     """Uses the LLM to generate a table description based on its name and schema."""
     model = get_model()
-    project = st.session_state.pick_project # <-- MODIFIED
-    dataset = st.session_state.pick_dataset # <-- MODIFIED
-    table = st.session_state.pick_table # <-- MODIFIED
+    project = st.session_state.pick_project 
+    dataset = st.session_state.pick_dataset 
+    table = st.session_state.pick_table 
     schema_df = st.session_state.bq_schema_df
 
     if not all([project, dataset, table]) or schema_df.empty:
@@ -266,9 +659,9 @@ def enhance_table_description_llm():
 def enhance_column_descriptions_llm():
     """Uses the LLM to generate descriptions for all columns in a table."""
     model = get_model()
-    project = st.session_state.pick_project # <-- MODIFIED
-    dataset = st.session_state.pick_dataset # <-- MODIFIED
-    table = st.session_state.pick_table # <-- MODIFIED
+    project = st.session_state.pick_project 
+    dataset = st.session_state.pick_dataset 
+    table = st.session_state.pick_table 
     schema_df = st.session_state.bq_schema_df.copy()
 
     if not all([project, dataset, table]) or schema_df.empty:
@@ -279,35 +672,36 @@ def enhance_column_descriptions_llm():
 
     # Collect lightweight summaries for each column to inform the LLM and to append to descriptions
     summaries = {}
-    for _, row in schema_df.iterrows():
-        col = row['column_name']
-        dtype = (row.get('data_type') or '').upper()
-        col_back = f"`{col}`"
-        table_fq = f"`{project}.{dataset}.{table}`"
+    with st.spinner("Analyzing column statistics in BigQuery..."):
+        for _, row in schema_df.iterrows():
+            col = row['column_name']
+            dtype = (row.get('data_type') or '').upper()
+            col_back = f"`{col}`"
+            table_fq = f"`{project}.{dataset}.{table}`"
 
-        # Build a small targeted query depending on data type
-        if any(t in dtype for t in ['STRING', 'BYTES', 'CHAR']):
-            qry = f"SELECT ARRAY_AGG(DISTINCT {col_back} ORDER BY {col_back} LIMIT 10) AS distinct_vals, COUNT(DISTINCT {col_back}) AS distinct_count FROM {table_fq} WHERE {col_back} IS NOT NULL"
-        elif any(t in dtype for t in ['DATE', 'TIMESTAMP', 'DATETIME']):
-            qry = f"SELECT MIN({col_back}) AS min_val, MAX({col_back}) AS max_val FROM {table_fq} WHERE {col_back} IS NOT NULL"
-        elif any(t in dtype for t in ['INT', 'INTEGER', 'NUMERIC', 'FLOAT', 'DOUBLE', 'DECIMAL']):
-            # Use APPROX_QUANTILES to avoid scanning huge tables in some cases
-            qry = f"SELECT MIN({col_back}) AS min_val, MAX({col_back}) AS max_val, AVG({col_back}) AS avg_val FROM {table_fq} WHERE {col_back} IS NOT NULL"
-        elif any(t in dtype for t in ['BOOL', 'BOOLEAN']):
-            qry = f"SELECT COUNTIF({col_back}) AS true_count, COUNT(*) - COUNTIF({col_back}) AS false_count, COUNT(*) AS total_count FROM {table_fq}"
-        else:
-            # Fallback: sample distinct values
-            qry = f"SELECT ARRAY_AGG(DISTINCT {col_back} ORDER BY {col_back} LIMIT 10) AS distinct_vals, COUNT(DISTINCT {col_back}) AS distinct_count FROM {table_fq} WHERE {col_back} IS NOT NULL"
-
-        try:
-            df_sum = client.query(qry).to_dataframe()
-            if not df_sum.empty:
-                # Convert numpy types to python native with json-safe conversions later
-                summaries[col] = {k: (v.tolist() if hasattr(v, 'tolist') else v) for k, v in df_sum.iloc[0].to_dict().items()}
+            # Build a small targeted query depending on data type
+            if any(t in dtype for t in ['STRING', 'BYTES', 'CHAR']):
+                qry = f"SELECT ARRAY_AGG(DISTINCT {col_back} ORDER BY {col_back} LIMIT 10) AS distinct_vals, COUNT(DISTINCT {col_back}) AS distinct_count FROM {table_fq} WHERE {col_back} IS NOT NULL"
+            elif any(t in dtype for t in ['DATE', 'TIMESTAMP', 'DATETIME']):
+                qry = f"SELECT MIN({col_back}) AS min_val, MAX({col_back}) AS max_val FROM {table_fq} WHERE {col_back} IS NOT NULL"
+            elif any(t in dtype for t in ['INT', 'INTEGER', 'NUMERIC', 'FLOAT', 'DOUBLE', 'DECIMAL']):
+                # Use APPROX_QUANTILES to avoid scanning huge tables in some cases
+                qry = f"SELECT MIN({col_back}) AS min_val, MAX({col_back}) AS max_val, AVG({col_back}) AS avg_val FROM {table_fq} WHERE {col_back} IS NOT NULL"
+            elif any(t in dtype for t in ['BOOL', 'BOOLEAN']):
+                qry = f"SELECT COUNTIF({col_back}) AS true_count, COUNT(*) - COUNTIF({col_back}) AS false_count, COUNT(*) AS total_count FROM {table_fq}"
             else:
-                summaries[col] = {}
-        except Exception as e:
-            summaries[col] = {"error": str(e)}
+                # Fallback: sample distinct values
+                qry = f"SELECT ARRAY_AGG(DISTINCT {col_back} ORDER BY {col_back} LIMIT 10) AS distinct_vals, COUNT(DISTINCT {col_back}) AS distinct_count FROM {table_fq} WHERE {col_back} IS NOT NULL"
+
+            try:
+                df_sum = client.query(qry).to_dataframe()
+                if not df_sum.empty:
+                    # Convert numpy types to python native with json-safe conversions later
+                    summaries[col] = {k: (v.tolist() if hasattr(v, 'tolist') else v) for k, v in df_sum.iloc[0].to_dict().items()}
+                else:
+                    summaries[col] = {}
+            except Exception as e:
+                summaries[col] = {"error": str(e)}
 
     # Build prompt including summaries to give the model context about column values
     cols_to_describe = schema_df[['column_name', 'data_type']].to_dict('records')
@@ -337,6 +731,7 @@ Please return the output as a simple JSON object where keys are the column names
                 desc_dict = json.loads(json_str)
             except json.JSONDecodeError:
                 # If the LLM response isn't strict JSON, fall back to a safe heuristic: create descriptions from summaries
+                st.warning("AI response was not valid JSON, falling back to heuristic summary.")
                 desc_dict = {}
 
             # Build human-readable appendices from the computed summaries
@@ -344,7 +739,7 @@ Please return the output as a simple JSON object where keys are the column names
                 if not summ:
                     return ""
                 if 'error' in summ:
-                    return f" (Could not compute data summary: {summ['error']})"
+                    return f" (Could not compute data summary)" # Don't show full error
                 # Strings / categorical
                 if 'distinct_vals' in summ or 'distinct_count' in summ:
                     vals = summ.get('distinct_vals')
@@ -355,12 +750,13 @@ Please return the output as a simple JSON object where keys are the column names
                             return f" (Sample distinct values: {sample}; distinct count ≈ {cnt})"
                         return f" (Distinct count ≈ {cnt})"
                 # Dates
-                if 'min_val' in summ or 'max_val' in summ:
+                if 'min_val' in summ and 'max_val' in summ:
                     mn = summ.get('min_val')
                     mx = summ.get('max_val')
-                    return f" (Value range: {mn} → {mx})"
+                    if mn is not None and mx is not None:
+                        return f" (Value range: {mn} → {mx})"
                 # Numeric
-                if 'avg_val' in summ or 'min_val' in summ or 'max_val' in summ:
+                if 'avg_val' in summ or ('min_val' in summ and 'max_val' in summ):
                     mn = summ.get('min_val')
                     mx = summ.get('max_val')
                     avg = summ.get('avg_val')
@@ -505,7 +901,7 @@ def run_bigquery_query(sql_query: str) -> pd.DataFrame | None:
             results = query_job.to_dataframe()
         return results
     except GoogleAPIError as e:
-        st.error(f"BigQuery Error: {e.message}")
+        st.error(f"BigQuery Error: {str(e)}")
         return None
     except Exception as e:
         st.error(f"An unexpected error occurred while running the query: {e}")
@@ -638,13 +1034,15 @@ Insight:
             top = result_df[col].mode()
             if not top.empty:
                 top_val = top.iloc[0]
-                freq = result_df[col].value_counts().iloc[0]
+                freq = (result_df[col] == top_val).sum()
                 base_summary = f"In column '{col}', the most common value is '{top_val}' (appears {freq} times in the preview)."
                 if user_question:
                     return f"Key insight related to your question ('{user_question}'): {base_summary}"
                 return f"Key insight: {base_summary}"
     except Exception as e:
         return f"Could not generate a summary due to an error: {e}"
+    
+    return "Query executed. No summary could be generated."
 
 
 # =========================
@@ -658,24 +1056,30 @@ def render_ctx_page():
     # On page load, if context is set and upload schema is empty, populate them
     # This makes "Change Context" show the editable view
     if (st.session_state.ctx_set and 
-        st.session_state.selected_tables and
-        st.session_state.upload_schema_df.empty):  # Only check upload schema
-         table_info = st.session_state.selected_tables[0]
-         current_schema_df = st.session_state.schema_df.copy()
-         current_description = table_info.get('description', '')
-         context_source = st.session_state.get('context_source')
- 
-         if context_source == "upload":
-             st.session_state.upload_schema_df = current_schema_df
-             st.session_state.smpl_tbl_desc = current_description
-             
-         elif context_source == "bq":
-             st.session_state.bq_schema_df = current_schema_df
-             st.session_state.bq_table_desc = current_description
-             st.session_state.pick_project = table_info['project']
-             st.session_state.pick_dataset = table_info['dataset']
-             st.session_state.pick_table = table_info['table']
-             st.session_state.auth = True
+        st.session_state.selected_tables): 
+        
+        table_info = st.session_state.selected_tables[0]
+        current_schema_df = st.session_state.schema_df.copy()
+        current_description = table_info.get('description', '')
+        context_source = st.session_state.get('context_source')
+        
+        # Only populate the *specific* tab's state if it's currently empty
+        # This check prevents overwriting data if user switches tabs
+        if context_source == "upload" and st.session_state.upload_schema_df.empty:
+            st.session_state.upload_schema_df = current_schema_df
+            st.session_state.smpl_tbl_desc = current_description
+            
+        elif context_source == "bq" and st.session_state.bq_schema_df.empty:
+            st.session_state.bq_schema_df = current_schema_df
+            st.session_state.bq_table_desc = current_description
+            # Only set pickers if they are not already set
+            if st.session_state.pick_project is None:
+                st.session_state.pick_project = table_info['project']
+            if st.session_state.pick_dataset is None:
+                st.session_state.pick_dataset = table_info['dataset']
+            if st.session_state.pick_table is None:
+                st.session_state.pick_table = table_info['table']
+            st.session_state.auth = True
     # --- END MODIFIED LOGIC ---
 
     tab_upl, tab_pick = st.tabs(["Upload Schema", "Pick a BigQuery table"])
@@ -722,16 +1126,25 @@ def render_ctx_page():
                  st.write(f"• `{row['project']}.{row['dataset']}.{row['table']}`")
         else:
             df_editor = st.session_state.upload_schema_df
-            prj, dtset, tbl = df_editor['table_catalog'].unique()[0], df_editor['table_schema'].unique()[0], df_editor['table_name'].unique()[0]
+            # Handle potential missing columns if CSV is malformed
+            try:
+                prj = df_editor['table_catalog'].unique()[0]
+                dtset = df_editor['table_schema'].unique()[0]
+                tbl = df_editor['table_name'].unique()[0]
+            except (KeyError, IndexError):
+                st.error("Uploaded CSV is missing required columns: 'table_catalog', 'table_schema', 'table_name'.")
+                st.session_state.upload_schema_df = pd.DataFrame() # Clear the bad df
+                return
+
             st.write(f"`{prj}.{dtset}.{tbl}`")
 
             c1, c2 = st.columns([9, 2])
             c1.text_area("Table Description", key="smpl_tbl_desc", placeholder="Add custom description for this table", label_visibility="collapsed")
             c2.button("Enhance", 
-                        icon="🪄", help="A.I. will populate the table description for you", 
-                        on_click=enh_smpl_tbl_desc,
-                        key="enhance_upload_tbl_desc",
-                        args=[tbl])
+                            icon="🪄", help="A.I. will populate the table description for you", 
+                            on_click=enh_smpl_tbl_desc,
+                            key="enhance_upload_tbl_desc",
+                            args=[tbl])
 
             st.divider()
             st.caption("**Table Schema**")
@@ -747,9 +1160,24 @@ def render_ctx_page():
             if c3.button("Enhance Schema", icon="🪄", help="A.I. will populate the column description for you", key="enhance_upload_schema"):
                 # --- NOTE: This assumes 'data/sample_schema_with_desc.csv' exists ---
                 try:
-                    st.session_state.upload_schema_df = pd.read_csv("data/sample_schema_with_desc.csv")
-                except FileNotFoundError:
-                    st.error("`data/sample_schema_with_desc.csv` not found. Cannot enhance sample.")
+                    # --- Let's create a fallback DataFrame if file not found ---
+                    sample_data_desc = {
+                        'table_catalog': ['bigquery-public-data', 'bigquery-public-data'],
+                        'table_schema': ['new_york_citibike', 'new_york_citibike'],
+                        'table_name': ['citibike_trips', 'citibike_trips'],
+                        'column_name': ['tripduration', 'starttime'],
+                        'data_type': ['INTEGER', 'TIMESTAMP'],
+                        'column_description': ['The duration of the trip in seconds.', 'The time the trip started.']
+                    }
+                    try:
+                        sample_df_desc = pd.read_csv("data/sample_schema_with_desc.csv")
+                    except FileNotFoundError:
+                        st.warning("`data/sample_schema_with_desc.csv` not found. Using minimal enhanced sample.")
+                        sample_df_desc = pd.DataFrame(sample_data_desc)
+                        
+                    st.session_state.upload_schema_df = sample_df_desc
+                except Exception as e:
+                    st.error(f"Failed to load enhanced sample: {e}")
                 st.rerun()
             if c4.button("Set as Context", icon="🧠", key="set_context_upload_btn"):
                 set_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema, source="upload") # <--- MODIFIED
@@ -760,8 +1188,9 @@ def render_ctx_page():
     with tab_pick:
         st.subheader("1. Authenticate with Google")
         c1, c2 = st.columns([2, 5], vertical_alignment="center", gap="small")
-        if c1.button("Login to Google", icon="🔑", use_container_width=True):
+        if c1.button("Login to Google", icon="🔑", use_container_width=True, disabled=st.session_state.auth):
             st.session_state.auth = True
+            st.rerun() # Rerun to show success
         with c2:
             if st.session_state.auth: st.success("Login Successful.", icon="✅")
             else: st.info("Please login to access your data warehouse.", icon="ℹ️")
@@ -777,6 +1206,9 @@ def render_ctx_page():
                 projects = []
             except GoogleAPIError as e:
                 st.error(f"Error listing projects: {e}")
+                projects = []
+            except Exception as e:
+                st.error(f"An unexpected error occurred: {e}")
                 projects = []
 
             # --- MODIFIED: Use key to manage state, no redundant assignment ---
@@ -797,7 +1229,8 @@ def render_ctx_page():
                 if st.session_state.bq_schema_df.empty or st.session_state.bq_schema_df['table_name'].iloc[0] != table_val: # <-- MODIFIED
                     st.session_state.bq_schema_df = get_table_schema(project_val, dataset_val, table_val) # <-- MODIFIED
                     st.session_state.bq_table_desc = ""
-                    # st.rerun() # Rerun can cause issues here
+                    st.rerun() # Rerun to populate the editor
+                
                 c1, c2 = st.columns([9, 2])
                 c1.text_area("Table Description", key="bq_table_desc", placeholder="Add custom description for this table", label_visibility="collapsed")
                 c2.button("Enhance", icon="🪄", 
@@ -914,7 +1347,7 @@ def render_default_page():
             "</div>",
             unsafe_allow_html=True,
         )
-        # return
+        # return # Keep rendering the rest of the page
 
     st.markdown("<h2 style='text-align:center;margin-top:0;'>🧐 What are you analyzing today?</h2>", unsafe_allow_html=True)
     
@@ -957,8 +1390,7 @@ def render_default_page():
                                 break
                         summary_text = summarize_query_result_llm(full_df, user_question=original_prompt)
                         st.session_state.messages[i]["summary"] = summary_text
-                        with st.chat_message("assistant"):
-                            st.info(summary_text)
+                        # No need for an extra chat message, just rerun to show the st.info
                         st.rerun()
                     
                     if msg.get("chart_created"):
@@ -1079,7 +1511,7 @@ def render_default_page():
     is_mid_conversation = last_plan_idx != -1 and last_plan_idx == len(st.session_state.messages) - 1
     placeholder = "Suggest an edit to the plan, or approve it." if is_mid_conversation else "What are you analyzing today?"
     
-    if prompt := st.chat_input(placeholder):
+    if prompt := st.chat_input(placeholder, disabled=not st.session_state.ctx_set):
         st.session_state.messages.append({"role": "user", "display_content": prompt, "content": prompt})
         with st.chat_message("user"): st.markdown(prompt)
             
@@ -1118,7 +1550,7 @@ else:
         if row.get("description"):
             st.sidebar.caption(row['description'])
     if not st.session_state.schema_df.empty:
-        st.sidebar.caption("Schema: loaded")
+        st.sidebar.caption(f"Schema: loaded ({st.session_state.get('context_source', 'N/A')})")
 
     if st.sidebar.button("View Context Details", icon="📄", use_container_width=True):
         st.session_state.view = "view_context"
