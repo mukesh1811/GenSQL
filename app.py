@@ -1,3 +1,9 @@
+#is there any day of the week contributing to higher sales than the rest by a significant margin ?
+#show the total sales as a percent
+# but is that significantly higher?
+
+
+
 ## auth
 # gcloud auth login
 # gcloud auth application-default login
@@ -30,6 +36,8 @@ import os
 import numpy as np
 from pathlib import Path
 
+from vertexai.generative_models import GenerativeModel
+from vertexai.language_models import TextEmbeddingModel
 
 VERTEX_LOCATION = "us-central1"  # fixed region; no env vars
 
@@ -237,11 +245,9 @@ def get_model():
     """Initializes Vertex AI and returns a Gemini model instance."""
     _safe_vertex_init()
     try:
-        from vertexai.generative_models import GenerativeModel
         return GenerativeModel("gemini-2.5-flash")
     except Exception:
         # Fallback for older client versions
-        from vertexai.generative_models import GenerativeModel
         return GenerativeModel("gemini-1.5-flash")
 
 
@@ -250,7 +256,6 @@ def get_model():
 def get_embedding_model():
     """Initializes and returns a Text Embedding model instance."""
     _safe_vertex_init()
-    from vertexai.language_models import TextEmbeddingModel
     candidates = ["gemini-embedding-001","text-embedding-005"]
     last_err = None
     for mid in candidates:
