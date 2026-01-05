@@ -362,8 +362,9 @@ def _init_state():
     ss.setdefault("view", "analysis") # analysis, context, view_context
     ss.setdefault("auth", False)
     ss.setdefault("ctx_set", False)
-    ss.setdefault("selected_tables", [])
-    ss.setdefault("schema_df", pd.DataFrame())
+    ss.setdefault("selected_tables", [])  # List of table info dicts
+    ss.setdefault("schemas", {})  # Dict of table FQN -> schema DataFrame
+    ss.setdefault("schema_df", pd.DataFrame())  # Legacy: kept for backward compatibility
     
     # --- NEW: State for BQ pickers ---
     ss.setdefault("pick_project", None)
@@ -388,22 +389,24 @@ _init_state()
 # --- NEW: CHROMA-BASED PERSISTENCE FUNCTIONS FOR APP STATE ---
 # ====================================================================
 
-def persist_current_context_marker(project: str, dataset: str, table: str, description: str | None = None):
-    """Persist a small marker in ChromaDB indicating the currently selected context.
-
-    This lets the app reload the last-used context across browser refreshes.
-    """
+def persist_current_context_marker():
+    """Persists the list of currently selected tables to ChromaDB."""
     try:
         client = get_chroma_client()
         coll = client.get_or_create_collection(name="app_state")
         ctx_id = "current_context"
+        
+        # Serialize the list of tables to a JSON string for storage in metadata
+        tables_json = json.dumps(st.session_state.selected_tables)
+        
         metadata = {
-            "project": project, 
-            "dataset": dataset, 
-            "table": table, 
-            "description": description or ""
+            "tables_json": tables_json,
+            "version": "2.0" # versioning for future compatibility
         }
-        doc = f"Current context: {project}.{dataset}.{table}"
+        
+        # Create a human-readable doc string
+        table_names = [f"{t['project']}.{t['dataset']}.{t['table']}" for t in st.session_state.selected_tables]
+        doc = f"Current context tables: {', '.join(table_names)}"
 
         existing = coll.get(ids=[ctx_id], include=['metadatas', 'documents'])
         if existing['ids']:
@@ -411,21 +414,12 @@ def persist_current_context_marker(project: str, dataset: str, table: str, descr
         else:
             coll.add(ids=[ctx_id], documents=[doc], metadatas=[metadata])
         
-        # Ensure files are flushed to disk
-    #     client.persist()
     except Exception as e:
         st.warning(f"Could not persist app state to ChromaDB: {e}")
 
 
 def load_persisted_context_to_session():
-    """Load persisted context from ChromaDB (if any) into `st.session_state`.
-
-    Attempts to fetch the app-level marker and then reconstruct the full schema
-    either from BigQuery (preferred) or from Chroma-stored column contexts.
-    
-    This should only run ONCE at the start of the app.
-    """
-    # Only run if context is NOT already set (e.g., by user action in this session)
+    """Load persisted context from ChromaDB (if any) into `st.session_state`."""
     if st.session_state.ctx_set:
         return
 
@@ -435,67 +429,87 @@ def load_persisted_context_to_session():
         existing = coll.get(ids=["current_context"], include=['metadatas', 'documents'])
         
         if not existing['ids']:
-            return # No persisted state found
+            return 
             
         meta = existing['metadatas'][0]
-        project = meta.get('project')
-        dataset = meta.get('dataset')
-        table = meta.get('table')
-        description = meta.get('description', '')
-
-        if not all([project, dataset, table]):
-            return # Invalid state saved
-
-        # Try to fetch the full schema from BigQuery (this will also load descriptions from Chroma)
-        try:
-            schema = get_table_schema(project, dataset, table)
-            if not schema.empty:
-                st.session_state.selected_tables = [{"project": project, "dataset": dataset, "table": table, "description": description}]
-                st.session_state.schema_df = schema
-                st.session_state.context_source = 'bq' # Assume it came from BQ
-                set_ctx_if_ready()
-                # restore pickers
-                st.session_state.pick_project = project
-                st.session_state.pick_dataset = dataset
-                st.session_state.pick_table = table
-                st.session_state.auth = True # We must be auth'd if this worked
-                print("Loaded context from BQ via persisted marker.")
+        tables_json = meta.get('tables_json')
+        
+        # Backward compatibility for single-table context
+        if not tables_json:
+            project = meta.get('project')
+            dataset = meta.get('dataset')
+            table = meta.get('table')
+            description = meta.get('description', '')
+            if all([project, dataset, table]):
+                tables_list = [{"project": project, "dataset": dataset, "table": table, "description": description}]
+            else:
                 return
-        except Exception:
-            # Ignore and fallback to rebuilding from Chroma
-            print("BQ fetch failed, falling back to Chroma-only context.")
-            pass
+        else:
+            try:
+                tables_list = json.loads(tables_json)
+            except json.JSONDecodeError:
+                return
 
-        # Fallback: reconstruct minimal schema from Chroma-stored column contexts
-        contexts = get_context(table)
-        if contexts['ids']:
-            cols = []
-            for idx, md in enumerate(contexts.get('metadatas', [])):
-                col_name = md.get('column_name')
-                desc = md.get('description', '') # Get raw description
-                cols.append({
-                    'table_catalog': project or '',
-                    'table_schema': dataset or '',
-                    'table_name': table,
-                    'column_name': col_name,
-                    'data_type': 'UNKNOWN', # BQ info was lost
-                    'column_description': desc
-                })
+        loaded_tables = []
+        loaded_schemas = {}
+        last_schema_df = pd.DataFrame()
+
+        for t_info in tables_list:
+            project = t_info.get('project')
+            dataset = t_info.get('dataset')
+            table = t_info.get('table')
+            description = t_info.get('description', '')
             
-            if cols:
-                schema_df = pd.DataFrame(cols)
-                st.session_state.selected_tables = [{"project": project, "dataset": dataset, "table": table, "description": description}]
-                st.session_state.schema_df = schema_df
-                st.session_state.context_source = 'chroma_fallback'
-                set_ctx_if_ready()
-                st.session_state.pick_project = project
-                st.session_state.pick_dataset = dataset
-                st.session_state.pick_table = table
-                st.session_state.auth = True # Assume auth, but BQ might fail
-                print("Loaded context from Chroma fallback.")
-                
+            if not all([project, dataset, table]):
+                continue
+
+            table_fqn = f"{project}.{dataset}.{table}"
+            schema_found = False
+            
+            # Try to fetch schema from BQ
+            try:
+                schema = get_table_schema(project, dataset, table)
+                if not schema.empty:
+                    loaded_schemas[table_fqn] = schema
+                    last_schema_df = schema
+                    schema_found = True
+            except Exception:
+                pass
+            
+            # Fallback to Chroma if BQ failed
+            if not schema_found:
+                contexts = get_context(table)
+                if contexts['ids']:
+                    cols = []
+                    for idx, md in enumerate(contexts.get('metadatas', [])):
+                        col_name = md.get('column_name')
+                        desc = md.get('description', '')
+                        cols.append({
+                            'table_catalog': project,
+                            'table_schema': dataset,
+                            'table_name': table,
+                            'column_name': col_name,
+                            'data_type': 'UNKNOWN',
+                            'column_description': desc
+                        })
+                    if cols:
+                        loaded_schemas[table_fqn] = pd.DataFrame(cols)
+                        last_schema_df = loaded_schemas[table_fqn]
+                        schema_found = True
+
+            if schema_found:
+                loaded_tables.append(t_info)
+
+        if loaded_tables:
+            st.session_state.selected_tables = loaded_tables
+            st.session_state.schemas = loaded_schemas
+            st.session_state.schema_df = last_schema_df
+            st.session_state.context_source = 'persisted'
+            set_ctx_if_ready()
+            st.session_state.auth = True 
+            print(f"Loaded {len(loaded_tables)} tables from persisted context.")
+
     except Exception as e:
-        # Best-effort loader; do not raise to avoid breaking UI
         st.warning(f"Could not load persisted context: {e}")
         return
 
@@ -510,20 +524,40 @@ load_persisted_context_to_session()
 # Helper Functions
 # =========================
 def set_ctx_if_ready():
-    """Marks context as set if a table and schema are present."""
-    st.session_state.ctx_set = bool(st.session_state.selected_tables) and (
-        not st.session_state.schema_df.empty
-    )
+    """Marks context as set if at least one table with schema is present."""
+    has_tables = bool(st.session_state.selected_tables)
+    has_schemas = bool(st.session_state.schemas) or not st.session_state.schema_df.empty
+    st.session_state.ctx_set = has_tables and has_schemas
 
-def set_context(project: str, dataset: str, table: str, description: str, schema_df: pd.DataFrame, source: str):
-    """Overwrites the main context with new table information."""
+def set_context(project: str, dataset: str, table: str, description: str, schema_df: pd.DataFrame, source: str, append: bool = False):
+    """Sets the context, either by replacing existing or appending to it."""
     if not all([project, dataset, table]) or schema_df.empty:
         st.error("Cannot set context with incomplete information.")
         return
-    st.session_state.selected_tables = [
-        {"project": project, "dataset": dataset, "table": table, "description": description}
-    ]
-    st.session_state.schema_df = schema_df
+
+    table_fqn = f"{project}.{dataset}.{table}"
+    new_entry = {"project": project, "dataset": dataset, "table": table, "description": description}
+
+    if not append:
+        # Replace mode: clear existing
+        st.session_state.selected_tables = [new_entry]
+        st.session_state.schemas = {table_fqn: schema_df}
+        st.session_state.schema_df = schema_df # legacy support
+    else:
+        # Append mode
+        # Check if already exists to avoid duplicates
+        exists = any(
+            t['project'] == project and t['dataset'] == dataset and t['table'] == table 
+            for t in st.session_state.selected_tables
+        )
+        if not exists:
+            st.session_state.selected_tables.append(new_entry)
+            st.session_state.schemas[table_fqn] = schema_df
+            # update legacy schema_df to be the latest added, or a concatenation? 
+            # For now, let's keep schema_df as the *most recently added* table's schema 
+            # to make single-table logic mostly work
+            st.session_state.schema_df = schema_df
+
     st.session_state.context_source = source 
     set_ctx_if_ready()
     
@@ -531,17 +565,43 @@ def set_context(project: str, dataset: str, table: str, description: str, schema
     try:
         persist_schema_to_chroma(project, dataset, table, schema_df, description)
         
-        # --- MODIFIED: Also persist this as the *current* context ---
-        persist_current_context_marker(project, dataset, table, description)
+        # --- MODIFIED: Persist the list of tables ---
+        persist_current_context_marker()
         
     except Exception as e:
         st.warning(f"Failed to persist schema to ChromaDB: {e}")
 
-    st.toast(f"Context set to `{project}.{dataset}.{table}`", icon="🧠")
+    action = "Added" if append else "Set"
+    st.toast(f"{action} context: `{project}.{dataset}.{table}`", icon="🧠")
+
+def add_table_to_context(project: str, dataset: str, table: str, description: str, schema_df: pd.DataFrame, source: str):
+    """Adds a table to the existing context."""
+    set_context(project, dataset, table, description, schema_df, source, append=True)
+
+def remove_table_from_context(index: int):
+    """Removes a table from context by index."""
+    if 0 <= index < len(st.session_state.selected_tables):
+        removed = st.session_state.selected_tables.pop(index)
+        table_fqn = f"{removed['project']}.{removed['dataset']}.{removed['table']}"
+        st.session_state.schemas.pop(table_fqn, None)
+        
+        # If we removed the last table, clear legacy schema_df, else set to last available
+        if not st.session_state.selected_tables:
+            st.session_state.schema_df = pd.DataFrame()
+        else:
+            last = st.session_state.selected_tables[-1]
+            last_fqn = f"{last['project']}.{last['dataset']}.{last['table']}"
+            st.session_state.schema_df = st.session_state.schemas.get(last_fqn, pd.DataFrame())
+            
+        set_ctx_if_ready()
+        persist_current_context_marker()
+        st.toast(f"Removed `{removed['table']}` from context.")
+        st.rerun()
 
 def clear_context():
     """Clears all context and chat history from the session."""
     st.session_state.selected_tables = []
+    st.session_state.schemas = {}
     st.session_state.schema_df = pd.DataFrame()
     st.session_state.ctx_set = False
     st.session_state.context_source = None 
@@ -559,15 +619,16 @@ def clear_context():
     st.toast("Context cleared.", icon="🗑️")
     st.rerun()
 
-def add_bq_table_to_context():
-    """Sets the selected BQ table as the main context."""
+def add_bq_table_to_context(append: bool = False):
+    """Sets or adds the selected BQ table to context."""
     set_context(
         project=st.session_state.pick_project, 
         dataset=st.session_state.pick_dataset, 
         table=st.session_state.pick_table, 
         description=st.session_state.bq_table_desc,
         schema_df=st.session_state.bq_schema_df,
-        source="bq" 
+        source="bq",
+        append=append
     )
     # Don't clear bq_schema_df, it's needed for the editor view
     # st.session_state.bq_schema_df = pd.DataFrame()
@@ -809,25 +870,41 @@ Please return the output as a simple JSON object where keys are the column names
 
 def _get_llm_context():
     """Builds the context string for the LLM prompts."""
-    if not st.session_state.selected_tables or st.session_state.schema_df.empty:
+    # We now use st.session_state.selected_tables (list) and st.session_state.schemas (dict)
+    if not st.session_state.selected_tables:
         st.error("Context is not set. Cannot generate SQL.")
         return None
 
-    table_info = st.session_state.selected_tables[0]
-    schema_df = st.session_state.schema_df
-    project = table_info['project']
-    dataset = table_info['dataset']
-    table = table_info['table']
-    table_description = table_info.get('description', 'No description provided.')
-    schema_str = schema_df[['column_name', 'data_type', 'column_description']].to_string(index=False)
+    context_parts = []
+    for idx, table_info in enumerate(st.session_state.selected_tables):
+        project = table_info['project']
+        dataset = table_info['dataset']
+        table = table_info['table']
+        table_fqn = f"{project}.{dataset}.{table}"
+        
+        table_description = table_info.get('description') or "No description provided."
+        
+        # Use schema from dict if available, else look in legacy/fallback
+        schema_df = st.session_state.schemas.get(table_fqn, pd.DataFrame())
+        
+        if schema_df.empty and idx == 0 and not st.session_state.schema_df.empty:
+             # Fallback: if it's the first table and it's in the legacy var
+             schema_df = st.session_state.schema_df
 
-    return f"""
-**Table Context:**
-- Fully Qualified Table Name: `{project}.{dataset}.{table}`
+        if not schema_df.empty:
+             schema_str = schema_df[['column_name', 'data_type', 'column_description']].to_string(index=False)
+        else:
+             schema_str = "(Schema not available)"
+
+        context_parts.append(f"""
+**Table {idx + 1} Context:**
+- Fully Qualified Table Name: `{table_fqn}`
 - Table Description: {table_description}
 - Table Schema:
 {schema_str}
-"""
+""")
+
+    return "\n---\n".join(context_parts)
 
 def generate_plan_llm(conversation_text: str):
     """Generates a plan based on the conversation history."""
@@ -1156,7 +1233,7 @@ def render_ctx_page():
             )
             st.session_state.upload_schema_df = edited_schema
 
-            c3, c4 = st.columns(2)
+            c3, c4, c5 = st.columns([1, 1, 1])
             if c3.button("Enhance Schema", icon="🪄", help="A.I. will populate the column description for you", key="enhance_upload_schema"):
                 # --- NOTE: This assumes 'data/sample_schema_with_desc.csv' exists ---
                 try:
@@ -1179,10 +1256,15 @@ def render_ctx_page():
                 except Exception as e:
                     st.error(f"Failed to load enhanced sample: {e}")
                 st.rerun()
-            if c4.button("Set as Context", icon="🧠", key="set_context_upload_btn"):
-                set_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema, source="upload") # <--- MODIFIED
+            
+            if c4.button("Set as Context", icon="🧠", help="Replace existing context with this table", key="set_context_upload_btn"):
+                set_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema, source="upload", append=False)
                 st.session_state.upload_schema_df = pd.DataFrame()
-                # st.session_state.smpl_tbl_desc = ""
+                st.rerun()
+                
+            if c5.button("Add to Context", icon="➕", help="Add this table to existing context", key="add_context_upload_btn"):
+                add_table_to_context(prj, dtset, tbl, st.session_state.smpl_tbl_desc, edited_schema, source="upload")
+                st.session_state.upload_schema_df = pd.DataFrame()
                 st.rerun()
 
     with tab_pick:
@@ -1249,21 +1331,30 @@ def render_ctx_page():
                         key="bq_schema_editor"
                     )
                     st.session_state.bq_schema_df = edited_bq_schema
-                    c3, c4 = st.columns(2)
+                    c3, c4, c5 = st.columns([1, 1, 1])
                     c3.button("Enhance Schema", icon="🪄", help="A.I. will populate column descriptions", on_click=enhance_column_descriptions_llm, key="enhance_bq_cols")
-                    c4.button("Set as Context", icon="🧠", on_click=add_bq_table_to_context, key="set_context_bq_btn")
+                    c4.button("Set as Context", icon="🧠", help="Replace existing context", on_click=add_bq_table_to_context, kwargs={"append": False}, key="set_context_bq_btn")
+                    c5.button("Add to Context", icon="➕", help="Add to existing context", on_click=add_bq_table_to_context, kwargs={"append": True}, key="add_context_bq_btn")
 
     st.divider()
-    st.caption("**Current Context:**")
+    st.divider()
+    st.subheader(f"Current Context ({len(st.session_state.selected_tables)} tables)")
     if not st.session_state.selected_tables:
         st.info("No context is set.")
     else:
-        row = st.session_state.selected_tables[0]
-        c1, c2 = st.columns([6, 1])
-        with c1:
-            st.write(f"• `{row['project']}.{row['dataset']}.{row['table']}`")
-            if row.get("description"): st.caption(row['description'])
-        c2.button("Clear Context", key="clear_ctx_btn", on_click=clear_context)
+        for idx, row in enumerate(st.session_state.selected_tables):
+            with st.container():
+                c1, c2 = st.columns([8, 1])
+                with c1:
+                    st.markdown(f"**{idx+1}.** `{row['project']}.{row['dataset']}.{row['table']}`")
+                    if row.get("description"): 
+                        st.caption(row['description'])
+                with c2:
+                    st.button("❌", key=f"rm_ctx_{idx}", help="Remove table", on_click=remove_table_from_context, args=[idx])
+                st.divider()
+        
+        if st.button("Clear All Context", key="clear_ctx_btn", type="primary"):
+            clear_context()
 
     st.divider()
     if st.button("Return", icon="⬅️", use_container_width=True):
@@ -1285,34 +1376,31 @@ def render_view_context_page():
             st.rerun()
         return
 
-    # Display current context
-    table_info = st.session_state.selected_tables[0]
-    schema_df = st.session_state.schema_df
-
-    st.subheader("Table Information")
-    st.markdown(f"**Name:** `{table_info['project']}.{table_info['dataset']}.{table_info['table']}`")
+    st.write(f"**Total Tables:** {len(st.session_state.selected_tables)}")
     
-    st.markdown("**Description:**")
-    if table_info.get('description'):
-        st.info(table_info['description'])
-    else:
-        st.caption("No description provided for this table.")
+    for idx, table_info in enumerate(st.session_state.selected_tables):
+        table_fqn = f"{table_info['project']}.{table_info['dataset']}.{table_info['table']}"
+        with st.expander(f"📄 {idx+1}. {table_fqn}", expanded=(idx==0)):
+            st.markdown(f"**Description:** {table_info.get('description') or 'No description'}")
+            
+            # Get schema for this table
+            schema_df = st.session_state.schemas.get(table_fqn, pd.DataFrame())
+            
+            # Fallback for legacy
+            if schema_df.empty and idx == 0 and not st.session_state.schema_df.empty:
+                schema_df = st.session_state.schema_df
 
-    st.divider()
-
-    st.subheader("Table Schema")
-    if schema_df.empty:
-        st.warning("Schema data is missing from the current context.")
-    else:
-        # Use st.dataframe for a read-only view
-        st.dataframe(
-            schema_df, 
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "column_description": st.column_config.TextColumn("Column Description")
-            }
-        )
+            if schema_df.empty:
+                 st.warning("Schema data is missing for this table.")
+            else:
+                st.dataframe(
+                    schema_df, 
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "column_description": st.column_config.TextColumn("Column Description")
+                    }
+                )
     
     st.divider()
 
@@ -1545,12 +1633,12 @@ if not st.session_state.ctx_set:
 else:
     st.sidebar.success("Context set", icon="✅")
     if st.session_state.selected_tables:
-        row = st.session_state.selected_tables[0]
-        st.sidebar.write(f"**Table:** `{row['project']}.{row['dataset']}.{row['table']}`")
-        if row.get("description"):
-            st.sidebar.caption(row['description'])
-    if not st.session_state.schema_df.empty:
-        st.sidebar.caption(f"Schema: loaded ({st.session_state.get('context_source', 'N/A')})")
+        count = len(st.session_state.selected_tables)
+        st.sidebar.write(f"**Tables:** {count} table(s) in context")
+        for row in st.session_state.selected_tables:
+             st.sidebar.caption(f"• `{row['table']}`")
+    
+    # st.sidebar.caption(f"Schema: loaded ({st.session_state.get('context_source', 'N/A')})")
 
     if st.sidebar.button("View Context Details", icon="📄", use_container_width=True):
         st.session_state.view = "view_context"
