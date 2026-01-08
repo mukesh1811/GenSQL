@@ -2,13 +2,14 @@
 Context manager for table/column metadata.
 
 Handles saving, retrieving, and managing table and column context
-in ChromaDB with embeddings for semantic search.
+in an in-memory vector store with embeddings for semantic search.
 """
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 
-from src.database import get_context_collection, get_bq_client
+from src.database import get_context_collection, get_bq_client, get_app_state_collection, search_by_embedding
 from src.ai import get_embedding
 
 
@@ -20,8 +21,8 @@ def save_context(
     dataset: str | None = None
 ) -> None:
     """
-    Save or update context in ChromaDB with embeddings.
-    
+    Save or update context in the in-memory vector store with embeddings.
+
     Args:
         table_id: Table identifier
         column_name: Column name
@@ -31,10 +32,10 @@ def save_context(
     """
     collection = get_context_collection()
     context_id = f"{table_id}_{column_name}"
-    
+
     # Generate embedding for the description
     embedding = get_embedding(description)
-    
+
     # Prepare combined text for document (for better semantic search)
     combined_text = f"Table: {table_id}\nColumn: {column_name}\nDescription: {description}"
 
@@ -49,28 +50,13 @@ def save_context(
     if dataset:
         metadata["dataset"] = dataset
 
-    # Check if context already exists
-    existing = collection.get(
-        ids=[context_id],
-        include=['metadatas', 'documents', 'embeddings']
-    )
-
-    if existing['ids']:
-        # Update existing context
-        collection.update(
-            ids=[context_id],
-            documents=[combined_text],
-            embeddings=[embedding],
-            metadatas=[metadata]
-        )
-    else:
-        # Add new context
-        collection.add(
-            ids=[context_id],
-            documents=[combined_text],
-            embeddings=[embedding],
-            metadatas=[metadata]
-        )
+    # Store in dictionary (add or update is the same operation)
+    collection[context_id] = {
+        "id": context_id,
+        "document": combined_text,
+        "embedding": np.asarray(embedding),
+        "metadata": metadata
+    }
 
 
 def persist_schema_to_chroma(
@@ -81,10 +67,10 @@ def persist_schema_to_chroma(
     table_description: str | None = None
 ) -> None:
     """
-    Persist a full schema (table + columns) into ChromaDB.
-    
+    Persist a full schema (table + columns) into the vector store.
+
     For each column in schema_df, saves context with embeddings.
-    
+
     Args:
         project: GCP project ID
         dataset: Dataset ID
@@ -93,16 +79,16 @@ def persist_schema_to_chroma(
         table_description: Optional table-level description
     """
     table_id = table  # Keep backward compatibility
-    
+
     for _, row in schema_df.iterrows():
         col = row.get('column_name')
         # Prefer explicitly provided column description
         desc = row.get('column_description') if row.get('column_description') is not None else ''
         final_desc = str(desc) if str(desc).strip() else (table_description or '')
-        
+
         if not col:
             continue
-            
+
         try:
             save_context(
                 table_id=table_id,
@@ -118,73 +104,93 @@ def persist_schema_to_chroma(
 
 def get_context(table_id: str = None, column_name: str = None) -> dict:
     """
-    Retrieve context from ChromaDB.
-    
+    Retrieve context from the in-memory vector store.
+
     Args:
         table_id: Optional table ID filter
         column_name: Optional column name filter
-        
+
     Returns:
-        dict: ChromaDB query results with ids, metadatas, documents, embeddings
+        dict: Results with ids, metadatas, documents, embeddings
     """
     collection = get_context_collection()
-    
+
     if table_id is None:
         # Get all contexts
-        return collection.get(include=['metadatas', 'documents', 'embeddings'])
-    
+        if not collection:
+            return {"ids": [], "metadatas": [], "documents": [], "embeddings": []}
+
+        return {
+            "ids": list(collection.keys()),
+            "metadatas": [item["metadata"] for item in collection.values()],
+            "documents": [item["document"] for item in collection.values()],
+            "embeddings": [item["embedding"].tolist() if hasattr(item["embedding"], 'tolist')
+                          else item["embedding"] for item in collection.values()]
+        }
+
     if column_name is None:
         # Get all contexts for a specific table
-        return collection.get(
-            where={"table_id": table_id},
-            include=['metadatas', 'documents', 'embeddings']
-        )
-    
+        filtered = {k: v for k, v in collection.items()
+                   if v["metadata"].get("table_id") == table_id}
+
+        if not filtered:
+            return {"ids": [], "metadatas": [], "documents": [], "embeddings": []}
+
+        return {
+            "ids": list(filtered.keys()),
+            "metadatas": [item["metadata"] for item in filtered.values()],
+            "documents": [item["document"] for item in filtered.values()],
+            "embeddings": [item["embedding"].tolist() if hasattr(item["embedding"], 'tolist')
+                          else item["embedding"] for item in filtered.values()]
+        }
+
     # Get specific context
     context_id = f"{table_id}_{column_name}"
-    return collection.get(
-        ids=[context_id],
-        include=['metadatas', 'documents', 'embeddings']
-    )
+    if context_id not in collection:
+        return {"ids": [], "metadatas": [], "documents": [], "embeddings": []}
+
+    item = collection[context_id]
+    return {
+        "ids": [context_id],
+        "metadatas": [item["metadata"]],
+        "documents": [item["document"]],
+        "embeddings": [item["embedding"].tolist() if hasattr(item["embedding"], 'tolist')
+                      else item["embedding"]]
+    }
 
 
 def search_similar_contexts(query: str, n_results: int = 5) -> dict:
     """
     Search for similar contexts using semantic similarity.
-    
+
     Args:
         query: Search query text
         n_results: Number of results to return
-        
+
     Returns:
         dict: Query results with metadatas, documents, distances
     """
     collection = get_context_collection()
     query_embedding = get_embedding(query)
-    
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=n_results,
-        include=['metadatas', 'documents', 'distances']
-    )
-    
+
+    results = search_by_embedding(collection, query_embedding, n_results)
+
     return results
 
 
 def delete_context(table_id: str, column_name: str) -> None:
     """
-    Delete a specific context from ChromaDB.
-    
+    Delete a specific context from the in-memory store.
+
     Args:
         table_id: Table identifier
         column_name: Column name
     """
-    from src.database import get_chroma_client
-    
-    client = get_chroma_client()
-    collection = client.get_or_create_collection(name="schema_context")
+    collection = get_context_collection()
     context_id = f"{table_id}_{column_name}"
-    collection.delete(ids=[context_id])
+
+    if context_id in collection:
+        del collection[context_id]
 
 
 def set_ctx_if_ready() -> None:
@@ -205,7 +211,7 @@ def set_context(
 ) -> None:
     """
     Sets the context, either by replacing existing or appending to it.
-    
+
     Args:
         project: GCP project ID
         dataset: Dataset ID
@@ -216,7 +222,7 @@ def set_context(
         append: If True, append to existing context; if False, replace
     """
     from .persistence import persist_current_context_marker
-    
+
     if not all([project, dataset, table]) or schema_df.empty:
         st.error("Cannot set context with incomplete information.")
         return
@@ -248,13 +254,13 @@ def set_context(
 
     st.session_state.context_source = source
     set_ctx_if_ready()
-    
-    # Persist schema & descriptions to ChromaDB
+
+    # Persist schema & descriptions to vector store
     try:
         persist_schema_to_chroma(project, dataset, table, schema_df, description)
         persist_current_context_marker()
     except Exception as e:
-        st.warning(f"Failed to persist schema to ChromaDB: {e}")
+        st.warning(f"Failed to persist schema: {e}")
 
     action = "Added" if append else "Set"
     st.toast(f"{action} context: `{project}.{dataset}.{table}`", icon="🧠")
@@ -275,17 +281,17 @@ def add_table_to_context(
 def remove_table_from_context(index: int) -> None:
     """
     Removes a table from context by index.
-    
+
     Args:
         index: Index in selected_tables list
     """
     from .persistence import persist_current_context_marker
-    
+
     if 0 <= index < len(st.session_state.selected_tables):
         removed = st.session_state.selected_tables.pop(index)
         table_fqn = f"{removed['project']}.{removed['dataset']}.{removed['table']}"
         st.session_state.schemas.pop(table_fqn, None)
-        
+
         # If we removed the last table, clear legacy schema_df
         if not st.session_state.selected_tables:
             st.session_state.schema_df = pd.DataFrame()
@@ -295,7 +301,7 @@ def remove_table_from_context(index: int) -> None:
             st.session_state.schema_df = st.session_state.schemas.get(
                 last_fqn, pd.DataFrame()
             )
-            
+
         set_ctx_if_ready()
         persist_current_context_marker()
         st.toast(f"Removed `{removed['table']}` from context.")
@@ -304,22 +310,23 @@ def remove_table_from_context(index: int) -> None:
 
 def clear_context() -> None:
     """Clears all context and chat history from the session."""
-    from src.database import get_chroma_client
-    
     st.session_state.selected_tables = []
     st.session_state.schemas = {}
     st.session_state.schema_df = pd.DataFrame()
     st.session_state.ctx_set = False
     st.session_state.context_source = None
     st.session_state.messages = []
-    
-    # Clear the persisted marker
+
+    # Clear the in-memory stores
     try:
-        client = get_chroma_client()
-        coll = client.get_or_create_collection(name="app_state")
-        coll.delete(ids=["current_context"])
+        schema_collection = get_context_collection()
+        schema_collection.clear()
+
+        app_state = get_app_state_collection()
+        if "current_context" in app_state:
+            del app_state["current_context"]
     except Exception as e:
-        st.warning(f"Could not clear persisted app state: {e}")
-        
+        st.warning(f"Could not clear app state: {e}")
+
     st.toast("Context cleared.", icon="🗑️")
     st.rerun()

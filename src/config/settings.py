@@ -35,18 +35,6 @@ class Settings:
         self.APP_ICON: str = os.getenv("APP_ICON", "✨")
         self.ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 
-        # ChromaDB Configuration
-        chroma_dir = os.getenv("CHROMA_PERSIST_DIR")
-        if chroma_dir:
-            self.CHROMA_PERSIST_DIR = Path(chroma_dir)
-        else:
-            # Default to chroma_db folder relative to project root
-            try:
-                base_dir = Path(__file__).resolve().parent.parent.parent
-            except Exception:
-                base_dir = Path.cwd()
-            self.CHROMA_PERSIST_DIR = base_dir / "chroma_db"
-
         # Logging Configuration
         self.LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 

@@ -72,9 +72,9 @@ def list_tables(project_id: str, dataset_id: str) -> list[str]:
 def get_table_schema(project_id: str, dataset_id: str, table_id: str) -> pd.DataFrame:
     """
     Fetches the schema for a given BigQuery table.
-    
+
     Queries INFORMATION_SCHEMA.COLUMNS to get column metadata and adds
-    a column_description field (with defaults from ChromaDB if available).
+    a column_description field (with defaults from vector store if available).
     
     Args:
         project_id: GCP project ID
@@ -105,7 +105,7 @@ def get_table_schema(project_id: str, dataset_id: str, table_id: str) -> pd.Data
         df["column_description"] = default_desc
         df["column_description"] = df["column_description"].astype("string")
         
-        # Load descriptions from ChromaDB
+        # Load descriptions from vector store
         stored_context = get_context(table_id)
         if stored_context["ids"]:
             for metadata in stored_context["metadatas"]:

@@ -15,9 +15,6 @@ google-api-core>=2.15.0
 # Vertex AI / Gemini
 google-cloud-aiplatform>=1.38.0
 
-# Vector Database
-chromadb>=0.4.18
-
 # Utilities
 python-dotenv>=1.0.0
 pathlib>=1.0.1

@@ -2,37 +2,30 @@
 Context persistence logic.
 
 Handles persisting and loading the application's context state
-(selected tables) to/from ChromaDB for session continuity.
+within session state. Note: Data does not persist across app restarts.
 """
 
 import json
 import streamlit as st
 import pandas as pd
 
-from src.database import get_chroma_client
+from src.database import get_app_state_collection
 from .manager import get_context, set_ctx_if_ready
 
 
 def persist_current_context_marker() -> None:
     """
-    Persists the list of currently selected tables to ChromaDB.
-    
-    Saves the selected_tables list to the app_state collection
-    for recovery on next app restart.
+    Persists the list of currently selected tables to session state.
+
+    Note: This only persists within the current session.
+    Data is lost on app restart.
     """
     try:
-        client = get_chroma_client()
-        coll = client.get_or_create_collection(name="app_state")
-        ctx_id = "current_context"
-        
+        app_state = get_app_state_collection()
+
         # Serialize the list of tables to JSON
         tables_json = json.dumps(st.session_state.selected_tables)
-        
-        metadata = {
-            "tables_json": tables_json,
-            "version": "2.0"  # versioning for future compatibility
-        }
-        
+
         # Create human-readable doc string
         table_names = [
             f"{t['project']}.{t['dataset']}.{t['table']}"
@@ -40,60 +33,46 @@ def persist_current_context_marker() -> None:
         ]
         doc = f"Current context tables: {', '.join(table_names)}"
 
-        existing = coll.get(ids=[ctx_id], include=['metadatas', 'documents'])
-        if existing['ids']:
-            coll.update(ids=[ctx_id], documents=[doc], metadatas=[metadata])
-        else:
-            coll.add(ids=[ctx_id], documents=[doc], metadatas=[metadata])
-        
+        app_state["current_context"] = {
+            "document": doc,
+            "metadata": {
+                "tables_json": tables_json,
+                "version": "2.0"
+            }
+        }
+
     except Exception as e:
-        st.warning(f"Could not persist app state to ChromaDB: {e}")
+        st.warning(f"Could not persist app state: {e}")
 
 
 def load_persisted_context_to_session() -> None:
     """
-    Load persisted context from ChromaDB (if any) into st.session_state.
-    
-    Attempts to restore previously selected tables and their schemas
-    from the app_state collection. Falls back to loading from schema_context
-    if BigQuery access fails.
+    Load persisted context from session state (if any).
+
+    Note: Since we use session state, this will only work within
+    the same session. Context does not persist across app restarts.
     """
     if st.session_state.ctx_set:
         return
 
     try:
         from src.database import get_table_schema
-        
-        client = get_chroma_client()
-        coll = client.get_or_create_collection(name="app_state")
-        existing = coll.get(ids=["current_context"], include=['metadatas', 'documents'])
-        
-        if not existing['ids']:
+
+        app_state = get_app_state_collection()
+
+        if "current_context" not in app_state:
             return
-            
-        meta = existing['metadatas'][0]
+
+        meta = app_state["current_context"].get("metadata", {})
         tables_json = meta.get('tables_json')
-        
-        # Backward compatibility for single-table context
+
         if not tables_json:
-            project = meta.get('project')
-            dataset = meta.get('dataset')
-            table = meta.get('table')
-            description = meta.get('description', '')
-            if all([project, dataset, table]):
-                tables_list = [{
-                    "project": project,
-                    "dataset": dataset,
-                    "table": table,
-                    "description": description
-                }]
-            else:
-                return
-        else:
-            try:
-                tables_list = json.loads(tables_json)
-            except json.JSONDecodeError:
-                return
+            return
+
+        try:
+            tables_list = json.loads(tables_json)
+        except json.JSONDecodeError:
+            return
 
         loaded_tables = []
         loaded_schemas = {}
@@ -103,14 +82,13 @@ def load_persisted_context_to_session() -> None:
             project = t_info.get('project')
             dataset = t_info.get('dataset')
             table = t_info.get('table')
-            description = t_info.get('description', '')
-            
+
             if not all([project, dataset, table]):
                 continue
 
             table_fqn = f"{project}.{dataset}.{table}"
             schema_found = False
-            
+
             # Try to fetch schema from BQ
             try:
                 schema = get_table_schema(project, dataset, table)
@@ -120,8 +98,8 @@ def load_persisted_context_to_session() -> None:
                     schema_found = True
             except Exception:
                 pass
-            
-            # Fallback to Chroma if BQ failed
+
+            # Fallback to in-memory store if BQ failed
             if not schema_found:
                 contexts = get_context(table)
                 if contexts['ids']:
@@ -152,7 +130,7 @@ def load_persisted_context_to_session() -> None:
             st.session_state.context_source = 'persisted'
             set_ctx_if_ready()
             st.session_state.auth = True
-            print(f"Loaded {len(loaded_tables)} tables from persisted context.")
+            print(f"Loaded {len(loaded_tables)} tables from session context.")
 
     except Exception as e:
         st.warning(f"Could not load persisted context: {e}")
